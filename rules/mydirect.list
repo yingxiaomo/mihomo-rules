@@ -1,0 +1,132 @@
+## 仅自用
+
+#---------------------------------------------------#
+#                   CDN & 云服务
+#---------------------------------------------------#
++.ghcr.io
++.zeabur.com
++.azureedge.net
++.msecnd.net
++.blob.core.windows.net
++.vo.msecnd.net
++.cloudapp.net
++.cloudapp.azure.com
++.akamaihd.net
+
+
+#---------------------------------------------------#
+#                       游戏
+#---------------------------------------------------#
+# Epic Games
++.epicgames.com
+# Razer
++.razer.com
+# Rockstar Games
++.rockstargames.com
+# Humble Bundle
++.humblebundle.com
+# Final Fantasy XIV
++.ffxiv.com
++.ffxiv.cn
+# Riot Games
++.pvp.net
++.riotcdn.net
++.anticheatexpert.com
+
+
+#---------------------------------------------------#
+#                 开发与技术工具
+#---------------------------------------------------#
++.dutils.com
++.ghfast.top
++.greasyfork.org
++.istoreos.com
++.koolcenter.com
++.linkease.com
++.lsposed.org
++.nn.ci
++.unpkg.com
++.ghproxy.net
++.gh-proxy.com
++.jsdelivr.net
++.agnes-ai.com
+
+#---------------------------------------------------#
+#                  IP与地理位置服务
+#---------------------------------------------------#
++.ip-api.com
++.ipapi.co
++.ipwho.is
++.ipwho.org
++.freeipapi.com
++.geoapi.info
+
+
+#---------------------------------------------------#
+#                  硬件与其他服务
+#---------------------------------------------------#
+# ASUS
++.asus.com
+# Meizu
++.flyme.com
+
+
+#---------------------------------------------------#
+#                   国内服务及网站
+#---------------------------------------------------#
++.nmliao.com
+# 高德地图
++.amap.com
+# 和风天气
++.qweatherapi.com
+# 阿里云盘
++.alipan.com
+# 网易
++.netease.com
+# 阅文集团
++.yuewen.cn
+# 盛趣游戏
++.qu.sdo.com
+# 堆糖
++.duitang.com
+# 灰机wiki
++.huijiwiki.com
+# Kling AI
++.klingai.com
+# 阅读APP
++.legado.cc
+# 其他
++.momoo.dpdns.org
++.170011.xyz
++.396638.xyz
++.ovoxo.cc
++.xiaomo.eu
++.mmoyo.cn
++.mmovo.com
++.bujidao.org
++.123624.com
++.xingliu.art
++.stepfun.com
++.link.cc
++.123yx.com
++.7moor-fs1.com
++.api-p1.yksdks.com
++.api.tongjiniao.com
++.api.xhofe.top
++.byyang.top
++.lanosso.com
++.likesrt.com
++.mgz6.cc
++.mgz6.com
++.miaogongzi.net
++.moeyy.xyz
++.tongjiniao.com
++.turingpic.com
++.yksdks.com
++.fnnas.com
++.hnczy.icu
++.xn--9kq49fww9d.com
++.xn--gvwa.xyz
+
+
++.ntp.org

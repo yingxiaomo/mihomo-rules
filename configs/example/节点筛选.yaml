@@ -1,0 +1,45 @@
+# =======================================================
+#               节点筛选锚点
+# =======================================================
+
+# --- 01. 亚洲核心圈 ---
+HK: &HK { filter: "(?i)香港|HK|HongKong|Hong Kong|🇭🇰" }
+TW: &TW { filter: "(?i)台湾|TW|TaiWan|Tai Wan|Hinet|🇹🇼" }
+JP: &JP { filter: "(?i)日本|Japan|JP|Tokyo|Osaka|东京|大阪|埼玉|🇯🇵" }
+SG: &SG { filter: "(?i)新加坡|狮城|SG|Singapore|🇸🇬" }
+KR: &KR { filter: "(?i)韩国|Korea|KR|Seoul|首尔|🇰🇷" }
+
+# --- 02. 亚太周边 ---
+MO: &MO { filter: "(?i)澳门|Macau|Macao|CTM|🇲🇴" }
+MY: &MY { filter: "(?i)马来|Malaysia|Kuala|吉隆坡|🇲🇾" }
+TH: &TH { filter: "(?i)泰国|Thai|Bangkok|曼谷|🇹🇭" }
+VN: &VN { filter: "(?i)越南|Viet|Hanoi|胡志明|🇻🇳" }
+PH: &PH { filter: "(?i)菲律宾|Philip|Manila|马尼拉|🇵🇭" }
+ID: &ID { filter: "(?i)印尼|Indo|Jakarta|雅加达|🇮🇩" }
+IN: &IN { filter: "(?i)印度|India|Mumbai|孟买|🇮🇳" }
+
+# --- 03. 美洲大陆 ---
+US: &US { filter: "(?i)美国|USA|United States|America|States|🇺🇸|(?i)US-|(?i)-US|(?i)US " }
+US_West: &US_West { filter: "(?i)Los Angeles|San Jose|Seattle|Portland|Phoenix|San Francisco|California|Silicon Valley|Las Vegas|洛杉矶|圣何塞|西雅图|波特兰|凤凰城|旧金山|加州|硅谷|拉斯维加斯" }
+US_East: &US_East { filter: "(?i)New York|Washington|Chicago|Miami|Atlanta|Virginia|Ashburn|NY|DC|纽约|华盛顿|芝加哥|迈阿密|弗吉尼亚" }
+
+CA: &CA { filter: "(?i)加拿大|Canada|Toronto|Vancouver|Montreal|多伦多|温哥华|蒙特利尔|🇨🇦" }
+MX: &MX { filter: "(?i)墨西哥|Mexico|🇲🇽" }
+SA_Nodes: &SA_Nodes { filter: "(?i)阿根廷|Argent|巴西|Brazil|智利|Chile|哥伦比亚|Colombia|秘鲁|Peru|圣保罗|Sao Paulo" }
+
+# --- 04. 欧洲 ---
+GB: &GB { filter: "(?i)英国|UK|England|United Kingdom|Britain|London|伦敦|🇬🇧" }
+DE: &DE { filter: "(?i)德国|Germany|Deutschland|Frankfurt|Berlin|法兰克福|柏林|🇩🇪" }
+FR: &FR { filter: "(?i)法国|France|Paris|巴黎|🇫🇷" }
+NL: &NL { filter: "(?i)荷兰|Netherlands|Dutch|Amsterdam|阿姆斯特丹|🇳🇱" }
+RU: &RU { filter: "(?i)俄罗斯|Russia|Moscow|Siberia|莫斯科|圣彼得堡|西伯利亚|🇷🇺" }
+
+EU_Other: &EU_Other { filter: "(?i)土耳其|Turkey|意大利|Italy|西班牙|Spain|葡萄牙|Portugal|瑞士|Swiss|Switzerland|瑞典|Sweden|乌克兰|Ukraine|爱尔兰|Ireland|挪威|Norway|芬兰|Finland|丹麦|Denmark|波兰|Poland|奥地利|Austria|罗马尼亚|Romania|希腊|Greece|冰岛|Iceland|匈牙利|Hungary" }
+
+# --- 05. 中东/非洲/大洋洲 ---
+AU: &AU { filter: "(?i)澳大利亚|澳洲|Australia|Sydney|Melbourne|悉尼|墨尔本|🇦🇺" }
+NZ: &NZ { filter: "(?i)新西兰|New Zealand|Auckland|奥克兰|🇳🇿" }
+MEA: &MEA { filter: "(?i)阿联酋|UAE|Dubai|迪拜|沙特|Saudi|以色列|Israel|南非|South Africa|埃及|Egypt|尼日利亚|Nigeria" }
+
+# --- 06. 漏网之鱼 ---
+Other: &Other { filter: "(?i)^(?!.*(?:香港|HK|台湾|TW|日本|JP|新加坡|SG|美国|USA|韩国|KR|英国|UK|德国|直连|Direct)).*" }

@@ -1,0 +1,22 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore data and model files
+data/
+Model.bin
+cache/
+mihomo-Alpha/
+transform.go
+.1.md
+
+# Ignore reference/template files
+train_flexible.py
+
+# Ignore local files
+.vscode/
+*.csv
+*.log
+*.sqlite3
+*.logtest
+test.py

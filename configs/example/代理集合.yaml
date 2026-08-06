@@ -1,0 +1,50 @@
+proxy-providers:                                                                                              
+  provider1:                                                                                              # 机场名字，不能重复，建议不要和策略组名称重复
+    type: http                                                                                            # provider类型，可选http / file / inline                         
+    url: "http://test.com"                                                                                # 机场订阅                    
+    path: ./proxy_providers/provider1.yaml                                                                # 机场配置文件本地存放路径以及文件名，必须以 .yaml 或 .yml 结尾                                                                     
+    interval: 3600                                                                                        # 机场订阅更新频率，单位为秒         
+    proxy: DIRECT                                                                                         # 订阅更新时使用的代理名称，可选                                       
+    size-limit: 0                                                                                         # 限制下载文件的最大大小，默认为 0 即不限制文件大小，单位为字节 (b)                                                        
+    age-secret-key: AGE-SECRET-KEY-1ZTQLLN0A4U3ZTT3DCZKYN0CGZEZQLWX2DFTXUWMT4ZHR0N2UG6LSW9NT0N            # 如果设置会age-secret-key尝试通过此secret解密age armor格式加密的配置文件，详细请参考：https://wiki.metacubex.one/config/proxy-providers/#age-secret-key                                                                                                      
+    header:                                                                                               # 自定义请求头，可选                                                
+      User-Agent:
+      - "mihomo/1.18.3"                                                                                   
+      Authorization:                                                                                    
+      - 'token 1231231'
+      # X-Age-Public-Key:
+      # - 'age1xh86kh9v23vattr58yedspm3f57sxvnswu9krr6ns438amekx5gsd09uma'
+    health-check:                                                                                         # 健康检查 (延迟测试) 
+      enable: true                                                                                        # 是否启用健康检查
+      url: https://www.gstatic.com/generate_204                                                           # 健康检查使用的URL地址
+      interval: 300                                                                                       # 健康检查间隔，单位为秒
+      timeout: 5000                                                                                       # 健康检查超时时间，单位为毫秒          
+      lazy: true                                                                                          # 是否启用懒惰健康检查模式，默认为 false
+      expected-status: 204                                                                                # 预期的HTTP状态码，默认为 200
+    override:                                                                                             # 可选，订阅内节点的属性覆盖配置                  
+      tfo: false                                                                                          # 是否启用 TCP Fast Open，默认为 false         
+      mptcp: false                                                                                        # 是否启用 MPTCP，默认为 false
+      udp: true                                                                                           # 是否启用 UDP 转发，默认为 true                    
+      udp-over-tcp: false                                                                                 # 是否启用 UDP over TCP，默认为 false                               
+      down: "50 Mbps"                                                                                     # 限制下载速度，格式为 <number> <unit>，unit 可选 bps / Kbps / Mbps / Gbps
+      up: "10 Mbps"                                                                                       # 限制上传速度，格式为 <number> <unit>，unit 可选 bps / Kbps / Mbps / Gbps
+      skip-cert-verify: true                                                                              # 是否跳过节点的证书验证，默认为 false          
+      dialer-proxy: proxy                                                                                 # 指定当前 proxies 通过 dialer-proxy 建立网络连接，值可以为策略组/出站代理的 name，用法参考：https://wiki.metacubex.one/config/proxies/dialer-proxy/
+      interface-name: tailscale0                                                                          # 指定节点绑定的接口，从此接口发起连接
+      routing-mark: 233                                                                                   # 指定节点拨号使用的路由标记值                        
+      ip-version: ipv4-prefer                                                                             # 代理软件出站使用的 ip 版本，如果不是 direct，则会影响 server 为域名时使用的 ip 地址，ipv4: 仅使用 IPv4，ipv6: 仅使用 IPv6，ipv4-prefer: 优先使用 IPv4，对于 TCP 会进行双栈解析，并发链接但是优先使用 IPv4 链接，UDP 则为双栈解析，获取结果中的第一个 IPv4，ipv6-prefer:优先使用 IPv6，对于 TCP 会进行双栈解析，并发链接但是优先使用 IPv6 链接，UDP 则为双栈解析，获取结果中的第一个 IPv6
+      additional-prefix: "provider1 prefix |"                                                             # 为节点名称添加前缀字符串
+      additional-suffix: "| provider1 suffix"                                                             # 为节点名称添加后缀字符串
+      proxy-name:                                                                                         # 对节点名称内容进行替换，支持正则表达式，pattern 为替换内容，target 为替换目标            
+      - pattern: "IPLC-(.*?)倍"
+        target: "iplc x $1"
+    filter: "(?i)港|hk|hongkong|hong kong"                                                                # 可选，筛选满足关键词或正则表达式的节点，可以使用 ` 区分多个正则表达式
+    exclude-filter: "xxx"                                                                                 # 可选，排除满足关键词或正则表达式的节点，可以使用 ` 区分多个正则表达式   
+    exclude-type: "ss|http"                                                                               # 可选，排除指定类型的节点，支持多种类型，用竖线 | 分隔
+    payload:                                                                                              # 手动添加节点，仅 type 为 inline 时生效，当 http 或 file 解析失败时，也可以使用 payload 作为备用代理                  
+      - name: "ss1"
+        type: ss
+        server: server
+        port: 443
+        cipher: chacha20-ietf-poly1305
+        password: "password"
