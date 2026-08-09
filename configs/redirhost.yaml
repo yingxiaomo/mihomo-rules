@@ -307,6 +307,8 @@ proxy-groups:
 
 # 规则匹配
 rules:
+  # 屏蔽 QUIC (UDP 443)，强制浏览器使用 TCP，避免 UDP 代理失败导致重复匹配
+  - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
   # 1. 基础通信放行 (P2P打洞端口)
   - DST-PORT,3478,DIRECT
   - DST-PORT,19302,DIRECT
