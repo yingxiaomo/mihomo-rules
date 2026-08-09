@@ -43,9 +43,10 @@ GO_REMOTE_URL = "https://raw.githubusercontent.com/yingxiaomo/mmihos/alpha-merge
 # StandardScaler 特征列表
 # 注意：这些特征必须与 transform.go 中的定义完全匹配
 STD_SCALER_FEATURES = [
-    'connect_time', 'latency', 'upload_mb', 'history_upload_mb', 
-    'maxuploadrate_kb', 'history_maxuploadrate_kb', 'download_mb', 
-    'history_download_mb', 'maxdownloadrate_kb', 'history_maxdownloadrate_kb', 
+    'connect_time', 'latency', 'upload_mb', 'history_upload_mb',
+    'maxuploadrate_kb', 'history_maxuploadrate_kb', 'download_mb',
+    'history_download_mb', 'maxdownloadrate_kb', 'history_maxdownloadrate_kb',
+    'ema_download_rate_kb',
     'duration_minutes', 'history_duration_minutes', 'traffic_ratio', 'traffic_density'
 ]
 
@@ -242,6 +243,59 @@ def get_feature_order() -> list:
     except Exception as e:
         logger.info(f"❌ [错误] 下载失败: {e}")
         raise RuntimeError("无法获取特征定义")
+
+
+def check_data_balance(df: pd.DataFrame, top_ratio_threshold: float = 0.5, min_nodes: int = 5) -> bool:
+    """
+    节点分布健康检查：识别反馈循环/选择偏差风险。
+
+    当内核开 `uselightgbm: true` 时，模型只让被它偏好的节点产生大量数据，
+    未选中的节点几乎没有新样本 -> 每天用该数据训练会让模型自我强化当前偏好
+    （"训练节点永远选不到"的统计版）。健康数据应覆盖足够多的节点、且没有
+    单一节点独占。此检查在训练前跑，异常时告警但不阻断。
+
+    返回 True=健康可训练，False=存在反馈循环/多样性风险。
+    """
+    if df is None or len(df) == 0:
+        logger.info("ℹ️ 无数据，跳过节点分布检查")
+        return False
+
+    if 'node_name' not in df.columns:
+        logger.info("ℹ️ 数据缺少 node_name 列，跳过节点分布检查")
+        return True
+
+    counts = df['node_name'].value_counts()
+    total = len(df)
+    coverage = len(counts)
+    top_node = counts.index[0]
+    top_ratio = counts.iloc[0] / total
+    top5_ratio = counts.head(5).sum() / total
+
+    logger.info("📊 [节点分布检查]")
+    logger.info(f"  覆盖节点数: {coverage} | 总样本: {total}")
+    logger.info(f"  单节点最大占比: {top_ratio:.1%} ({top_node})")
+    logger.info(f"  前5节点合计占比: {top5_ratio:.1%}")
+
+    warnings = []
+    if coverage < min_nodes:
+        warnings.append(f"覆盖节点过少 ({coverage}<{min_nodes})，样本代表性不足")
+    if top_ratio > top_ratio_threshold:
+        warnings.append(
+            f"单节点占比 {top_ratio:.1%} > {top_ratio_threshold:.0%}，疑似反馈循环："
+            "被模型偏好的节点自我强化，其他节点几乎无样本。建议提高 explore-rate、"
+            "多攒几天数据，或先做节点均衡采样再训"
+        )
+    if top5_ratio > 0.9:
+        warnings.append("前5节点合计占比 >90%，节点多样性不足")
+
+    if warnings:
+        logger.warning("⚠️ 节点分布健康告警（反馈循环风险）:")
+        for w in warnings:
+            logger.warning(f"  - {w}")
+        logger.info("💡 若本批次数据来自 uselightgbm:true 运行，请斟酌是否用此数据训练")
+        return False
+    logger.info("✅ 节点分布健康，可直接训练")
+    return True
 
 
 def load_data(data_dir: Path) -> pd.DataFrame:
@@ -509,6 +563,11 @@ def run_training():
         logger.info(f"❌ 数据加载失败: {e}")
         logger.info("请确认数据目录中存在 CSV 文件，或使用 --data_dir 指定正确目录。")
         return
+
+    # 节点分布健康检查：检测反馈循环/选择偏差，避免模型自我强化当前偏好
+    data_healthy = check_data_balance(df)
+    if not data_healthy:
+        logger.info("⚠️ 数据分布不健康，本次训练仍在继续，但建议复核数据来源/探索率")
 
     try:
         result = preprocess_data(df, feature_order)
