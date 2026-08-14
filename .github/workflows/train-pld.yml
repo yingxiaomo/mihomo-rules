@@ -1,20 +1,21 @@
-name: Train and Deploy Smart Model
+name: Train and Deploy PLD Smart Model
 
-# ⚠️ 默认仅支持【手动触发】（GitHub Actions 页面点 Run workflow）。
-# 本仓库的数据来自魔改内核（PLD 5 特征），与官方脚本默认的 30 特征 schema
-# 不同；保留此工作流是给使用官方版内核的用户作参考。若你的内核是官方版
-# （或 train.py 的特征与你的内核匹配），想改回自动触发，取消下方注释：
-#
-#   push:
-#     branches:
-#       - main
-#     paths:
-#       - 'smart_trainer/**'
-#       - '.github/workflows/train.yml'
-#   schedule:
-#     # 每周一早上 6:30 (中国时间, UTC+8) = 每周日 22:30 UTC
-#     - cron: '30 22 * * 0'
+# ⚠️ 本工作流默认【定时自动触发】：每周日 22:30 UTC（周一 6:30 北京时间）
+# 自动拉取 Google Drive 的 CSV 训练并发布 smart-pld-model，训练脚本变更时
+# 也会触发。运行前需在仓库 Secrets 配置：
+#   RCLONE_CONFIG_B64 — rclone.conf 的 base64（需含 gdrive 远程）
+#   REMOTE           — 数据目录，如 gdrive:smart_data
+#   TG_BOT_TOKEN / TG_CHAT_ID — 训练结果通知（可选）
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'smart_trainer/train_pld.py'
+      - '.github/workflows/train-pld.yml'
+  schedule:
+    # 每周一早上 6:30 (中国时间, UTC+8) = 每周日 22:30 UTC
+    - cron: '30 22 * * 0'
   workflow_dispatch:
 
 permissions:
@@ -27,13 +28,14 @@ jobs:
     env:
       RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
       REMOTE: ${{ secrets.REMOTE }}
-      LATEST_TAG: smart-model
-      
+      LATEST_TAG: smart-pld-model
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
+          ref: main
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v6
@@ -63,32 +65,31 @@ jobs:
             exit 1
           fi
 
-      - name: Run training script
+      - name: Run PLD training script
         id: training
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -o pipefail
-          python smart_trainer/train.py --data_dir .
+          python smart_trainer/train_pld.py --data_dir .
 
       - name: Upload model artifact
-        if: success() 
+        if: success()
         uses: actions/upload-artifact@v6
         with:
-          name: model-artifact
+          name: pld-model-artifact
           path: Model.bin
 
-      - name: Publish Smart Model
+      - name: Publish PLD Smart Model
         if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_NOTES="✨ 模型自动训练完成。<br><br>📅 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')<br>🔗 Commit: ${{ github.sha }}<br>🆔 Run ID: ${{ github.run_id }}"
-          # GitHub 无法修改已有 release 的发布时间，因此每次运行都删除旧 release+tag 再重建，让发布时间和 tag 保持最新
+          RELEASE_NOTES="✨ PLD Prior 模型自动训练完成。<br><br>📅 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')<br>🔗 Commit: ${{ github.sha }}<br>🆔 Run ID: ${{ github.run_id }}<br><br>特征: mmihos PLD 30 特征(reward label)<br>内核对齐: component/smart/lightgbm/prior.go"
           gh release delete "$LATEST_TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$LATEST_TAG" \
-            --title "Smart Model" \
+            --title "PLD Smart Model" \
             --notes "$RELEASE_NOTES" \
             --target main \
             --latest
@@ -98,4 +99,4 @@ jobs:
         if: always()
         run: |
           if [ -f "rclone.conf" ]; then rm rclone.conf; fi
-          rm -f *.csv smart_trainer/training.log
+          rm -f *.csv smart_trainer/training_pld.log

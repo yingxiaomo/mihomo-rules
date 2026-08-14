@@ -15,6 +15,7 @@ train_flexible.py
 
 # Ignore local files
 .vscode/
+venv/
 *.csv
 *.log
 *.sqlite3
