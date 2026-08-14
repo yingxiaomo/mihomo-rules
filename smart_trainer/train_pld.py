@@ -87,10 +87,64 @@ PLD_FEATURE_ORDER: List[str] = [
     "target_hash",        # 17 FNV-1a(SmartTarget) % 1000 + 1，站点集群
     "node_type",          # 18 AdapterType 枚举值（协议类型）
     "group_hash",         # 19 FNV-1a(groupName) % 200 + 1，策略组偏好
-    # 保留 (10) —— 内核固定 0 填充
-] + [f"reserved_{i}" for i in range(20, 30)]
+    "domain_traffic_level",  # 20 域名流量档位 0=unknown 1=small 2=medium 3=heavy
+    # 保留 (9) —— 内核固定 0 填充
+] + [f"reserved_{i}" for i in range(21, 30)]
 
 assert len(PLD_FEATURE_ORDER) == 30, f"PLD feature order must be 30, got {len(PLD_FEATURE_ORDER)}"
+
+# ---------------------------------------------------------------------------
+# 域名流量档位（feature 20）—— 与内核 traffic_profile.go 严格对齐
+# ---------------------------------------------------------------------------
+# 阈值：平均单次下载 < 512KiB → small；>= 512KiB → medium；>= 4MiB → heavy；
+# 历史峰值速率 >= 8MB/s 也可判 heavy。download_mb 单位为 MiB。
+TRAFFIC_SMALL_MB = 0.5    # 512 KiB
+TRAFFIC_HEAVY_MB = 4.0    # 4 MiB
+TRAFFIC_HEAVY_PEAK_KBPS = 8192.0
+
+# 内置「域名后缀 → 档位」表（与内核 builtinTrafficTable 同源）。
+# 只收录高置信条目：纯视频 CDN 子域 → heavy(3)；混合/音频/图片 CDN → medium(2)。
+# 应用壳域名（youtube.com / netflix.com 本身）刻意不在表内 —— 靠实测画像兜底。
+BUILTIN_TRAFFIC_TABLE = [
+    # heavy：纯视频流域名
+    (".googlevideo.com", 3),  # YouTube 视频流
+    (".gvt1.com", 3),         # YouTube 视频边缘节点
+    (".bilivideo.com", 3),    # B 站视频流
+    (".nflxvideo.net", 3),    # Netflix 视频流
+    (".hulustream.com", 3),   # Hulu 视频流
+    (".ttvnw.net", 3),        # Twitch 视频（hls/vod）
+    (".vhcdn.net", 3),        # 虎牙直播流
+    # medium：混合型 / 音频 / 图片 CDN
+    (".akamaized.net", 2),    # 混合（Netflix 视频 + 网站图片）
+    (".bmcdn.net", 2),        # B 站 CDN（视频+图片混合）
+    (".cloudfront.net", 2),   # AWS 混合 CDN
+    (".scdn.co", 2),          # Spotify 音频
+    (".tiktokcdn.com", 2),    # TikTok 混合
+    (".bytecdn.cn", 2),       # 抖音混合
+    (".gtimg.com", 2),        # 腾讯混合 CDN
+    (".iqiyipic.com", 2),     # 爱奇艺图片
+    (".ykimg.com", 2),        # 优酷图片
+]
+
+
+def builtin_traffic_level(host: str) -> int:
+    """内置表命中返回档位（3/2），未命中返回 0。"""
+    if not host:
+        return 0
+    h = str(host).strip().lower()
+    for suffix, level in BUILTIN_TRAFFIC_TABLE:
+        if h.endswith(suffix):
+            return level
+    return 0
+
+
+def traffic_level_from_avg(avg_download_mb: float, peak_kbps: float) -> int:
+    """按 target 聚合画像计算档位（与内核 UpdateTargetTrafficLevel 阈值一致）。"""
+    if avg_download_mb >= TRAFFIC_HEAVY_MB or peak_kbps >= TRAFFIC_HEAVY_PEAK_KBPS:
+        return 3
+    if avg_download_mb >= TRAFFIC_SMALL_MB:
+        return 2
+    return 1
 
 # ---------------------------------------------------------------------------
 # 与内核一致的 FNV-1a 哈希 (lightgbm.go:hashStringToFloat)
@@ -632,7 +686,10 @@ def hour_features(ts_str: str):
     h = 12.0
     try:
         t = pd.Timestamp(ts_str)
-        h = t.hour + t.minute / 60.0
+        if pd.isna(t):
+            h = 12.0  # NaN/NaT timestamp -> neutral noon
+        else:
+            h = t.hour + t.minute / 60.0
     except Exception:
         pass
     import math
@@ -684,18 +741,43 @@ def load_data(data_dir: Path) -> pd.DataFrame:
     logger.info("[步骤1] 加载原始数据")
     if not data_dir.exists():
         raise FileNotFoundError(f"数据目录不存在: {data_dir}")
-    files = sorted(glob.glob(str(data_dir / "*.csv")))
-    if not files:
-        raise FileNotFoundError(f"找不到 CSV: {data_dir}")
-    logger.info(f"📥 选中 {len(files)} 个 CSV")
+
+    import sqlite3
+
+    csv_files = sorted(glob.glob(str(data_dir / "*.csv")))
+    db_files = sorted(glob.glob(str(data_dir / "*.db")))
+    if not csv_files and not db_files:
+        raise FileNotFoundError(f"找不到 CSV/SQLite: {data_dir}")
+
     dfs = []
-    for f in files:
-        try:
-            df = pd.read_csv(f, encoding="utf-8", on_bad_lines="skip")
-            dfs.append(df)
-        except Exception as e:
-            logger.info(f"⚠️ 跳过 {f}: {e}")
-            continue
+    if csv_files:
+        logger.info(f"📥 选中 {len(csv_files)} 个 CSV")
+        for f in csv_files:
+            try:
+                df = pd.read_csv(f, encoding="utf-8", on_bad_lines="skip")
+                dfs.append(df)
+            except Exception as e:
+                logger.info(f"⚠️ 跳过 {f}: {e}")
+                continue
+
+    if db_files:
+        logger.info(f"📥 选中 {len(db_files)} 个 SQLite")
+        for f in db_files:
+            try:
+                conn = sqlite3.connect(f)
+                df = pd.read_sql("SELECT * FROM samples", conn)
+                conn.close()
+                # SQLite 的 ts 是 unix 秒 → 归一化成与 CSV 一致的 RFC3339 字符串
+                if "ts" in df.columns and "timestamp" not in df.columns:
+                    df["timestamp"] = (
+                        pd.to_datetime(df["ts"], unit="s")
+                        .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    )
+                dfs.append(df)
+            except Exception as e:
+                logger.info(f"⚠️ 跳过 {f}: {e}")
+                continue
+
     if not dfs:
         raise ValueError("无可用数据")
     merged = pd.concat(dfs, ignore_index=True)
@@ -707,7 +789,7 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     """从 raw CSV 行构造 PLD 30 特征。"""
     out = pd.DataFrame(index=df.index)
 
-    out["asn_feature"] = df["asn_raw"].map(extract_asn_feature)
+    out["asn_feature"] = df["asn_raw"].fillna("").map(extract_asn_feature)
     out["is_udp"] = df["is_udp"].astype(float)
 
     hs, hc, pk = [], [], []
@@ -718,9 +800,9 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     out["hour_cos"] = hc
     out["is_peak"] = pk
 
-    out["domain_feature"] = df["host_raw"].map(extract_domain_feature)
-    out["geo_feature"] = df["geoip_raw"].map(extract_geo_feature)
-    out["port_feature"] = df["port_raw"].map(extract_port_feature)
+    out["domain_feature"] = df["host_raw"].fillna("").map(extract_domain_feature)
+    out["geo_feature"] = df["geoip_raw"].fillna("").map(extract_geo_feature)
+    out["port_feature"] = df["port_raw"].fillna("0").map(extract_port_feature)
     out["traffic_class"] = [
         classify_traffic(bool(u), p)
         for u, p in zip(df["is_udp"].fillna(0).astype(int), df["port_raw"].fillna("0"))
@@ -770,8 +852,32 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
         var = float(np.var(rewards)) if len(rewards) > 1 else 0.0
         out.loc[g.index, "node_reward_var"] = min(max(var, 0.0), 2.0) / 2.0
 
+    # 域名流量档位（feature 20）：内置表优先（强语义，视频 CDN 子域），
+    # 未命中则按 target 聚合 download_mb 均值计算实测画像，冷启动为 0。
+    if "download_mb" in df.columns and "target" in df.columns:
+        tg_key = df["target"].fillna("").astype(str)
+        tg_avg = df.groupby(tg_key)["download_mb"].mean()
+        tg_peak = df.groupby(tg_key)["maxdownloadrate_kb"].max() if "maxdownloadrate_kb" in df.columns else None
+        target_level = {}
+        for tg, v in tg_avg.items():
+            pk = 0.0
+            if tg_peak is not None and tg in tg_peak.index:
+                pk = float(tg_peak.loc[tg] or 0.0)
+            target_level[tg] = traffic_level_from_avg(float(v), pk)
+    else:
+        target_level = {}
+    # 旧版 CSV 无 target 列时退回 host_raw 作为聚合键（与内核 SmartTarget 语义近似）
+    if "target" in df.columns:
+        level_key = df["target"].fillna("").astype(str)
+    else:
+        level_key = df["host_raw"].fillna("").astype(str)
+    out["domain_traffic_level"] = [
+        builtin_traffic_level(h) or target_level.get(str(t), 0)
+        for h, t in zip(df["host_raw"].fillna(""), level_key)
+    ]
+
     # 保留字段 0
-    for i in range(20, 30):
+    for i in range(21, 30):
         out[f"reserved_{i}"] = 0.0
 
     return out
