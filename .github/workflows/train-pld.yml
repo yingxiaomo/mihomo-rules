@@ -54,14 +54,16 @@ jobs:
       - name: Install rclone
         run: sudo apt-get update && sudo apt-get install -y rclone
 
-      - name: Pull CSV from Google Drive
+      - name: Pull PLD data from Google Drive
         run: |
-          rclone copy "$REMOTE" ./ --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO
+          # 只拉 PLD 数据（smart_samples*.db / smart_samples*.csv），
+          # 官方 smart_weight_data.csv 不参与 PLD 训练，云端即使有残留也不进本地
+          rclone copy "$REMOTE" ./ --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO --include "smart_samples*"
 
-      - name: Check for CSV data files
+      - name: Check for PLD data files
         run: |
-          if ! ls *.csv &> /dev/null; then
-            echo "::error::No CSV data files found in the root directory. Cannot proceed with training."
+          if ! ls smart_samples*.db smart_samples*.csv &> /dev/null; then
+            echo "::error::No PLD data files (smart_samples*.db / smart_samples*.csv) found. Cannot proceed with training."
             exit 1
           fi
 

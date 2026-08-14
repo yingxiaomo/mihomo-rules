@@ -747,14 +747,17 @@ def load_data(data_dir: Path) -> pd.DataFrame:
 
     import sqlite3
 
-    csv_files = sorted(glob.glob(str(data_dir / "*.csv")))
-    db_files = sorted(glob.glob(str(data_dir / "*.db")))
+    # 只收 PLD 数据：smart_samples*.csv（PLD CSV 回退）+ smart_samples*.db（PLD SQLite）。
+    # 官方 smart_weight_data.csv（40 列，缺 reward/target/node_delay/node_type）不参与
+    # PLD 训练，绝不能混入 data_dir —— 故这里按文件名白名单 + 必需列校验双重隔离。
+    csv_files = sorted(glob.glob(str(data_dir / "smart_samples*.csv")))
+    db_files = sorted(glob.glob(str(data_dir / "smart_samples*.db")))
     if not csv_files and not db_files:
-        raise FileNotFoundError(f"找不到 CSV/SQLite: {data_dir}")
+        raise FileNotFoundError(f"找不到 smart_samples*.csv / smart_samples*.db: {data_dir}")
 
     dfs = []
     if csv_files:
-        logger.info(f"📥 选中 {len(csv_files)} 个 CSV")
+        logger.info(f"📥 选中 {len(csv_files)} 个 CSV（smart_samples*.csv，已排除官方 smart_weight_data.csv）")
         for f in csv_files:
             try:
                 df = pd.read_csv(f, encoding="utf-8", on_bad_lines="skip")
@@ -781,8 +784,19 @@ def load_data(data_dir: Path) -> pd.DataFrame:
                 logger.info(f"⚠️ 跳过 {f}: {e}")
                 continue
 
+    # 必需列校验：官方 40 列 CSV（无 reward/target/node_delay/node_type）即使混入也会被拦下
+    required_cols = {"reward", "target", "node_delay", "node_type", "group_name"}
+    validated = []
+    for df in dfs:
+        missing = required_cols - set(df.columns)
+        if missing:
+            logger.warning(f"⚠️ 丢弃缺列样本（缺 {sorted(missing)}，疑似官方 smart_weight_data.csv，不用于 PLD 训练）")
+            continue
+        validated.append(df)
+    dfs = validated
+
     if not dfs:
-        raise ValueError("无可用数据")
+        raise ValueError("无可用数据（所有文件缺 PLD 必需列）")
     merged = pd.concat(dfs, ignore_index=True)
     logger.info(f"📊 加载 {len(merged)} 条")
     return merged
