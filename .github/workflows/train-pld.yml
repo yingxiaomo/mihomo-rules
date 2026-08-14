@@ -58,7 +58,8 @@ jobs:
         run: |
           # 只拉 PLD 数据（smart_samples*.db / smart_samples*.csv），
           # 官方 smart_weight_data.csv 不参与 PLD 训练，云端即使有残留也不进本地
-          rclone copy "$REMOTE" ./ --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO --include "smart_samples*"
+          # PLD 数据在 gdrive:smart_data/pld 独立分区（official/ 预留官方数据）
+          rclone copy "${REMOTE}/pld" ./ --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO --include "smart_samples*"
 
       - name: Check for PLD data files
         run: |

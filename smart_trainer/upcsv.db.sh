@@ -10,7 +10,7 @@ DATA_DIR=/etc/nikki/run
 DB_FILE="$DATA_DIR/smart_samples.db"
 CSV_FALLBACK="$DATA_DIR/smart_samples.csv"
 REMOTE=rclone
-GDRIVE_DIR=gdrive:smart_data
+GDRIVE_DIR=gdrive:smart_data/pld   # PLD 数据独立分区（official/ 预留官方数据）
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 
