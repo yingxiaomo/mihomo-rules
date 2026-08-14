@@ -79,7 +79,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: pld-model-artifact
-          path: Model.bin
+          path: PriorModel.bin
 
       - name: Publish PLD Smart Model
         if: success()
@@ -93,7 +93,7 @@ jobs:
             --notes "$RELEASE_NOTES" \
             --target main \
             --latest
-          gh release upload "$LATEST_TAG" Model.bin --clobber
+          gh release upload "$LATEST_TAG" PriorModel.bin --clobber
 
       - name: Cleanup
         if: always()
