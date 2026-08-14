@@ -194,7 +194,7 @@ dns:
     - https://8.8.8.8/dns-query#漏网之鱼&disable-ipv6=true  # 国外域名 -> 仅ipv4
 
 # 节点选择锚点
-all: &all { type: select, proxies: [ 新加坡智能, 香港智能, 台湾智能, 日本智能, 美国智能, 其他智能, 自建智能, 新加坡手动, 香港手动, 台湾手动, 日本手动, 美国手动, 其他手动, 自建手动, 全部手动, 新加坡自动, 香港自动, 台湾自动, 日本自动, 美国自动, 其他自动, 自建自动, 直连 ] }
+all: &all { type: select, proxies: [ 新加坡手动, 香港手动, 台湾手动, 日本手动, 美国手动, 其他手动, 自建手动, 全部手动, 新加坡自动, 香港自动, 台湾自动, 日本自动, 美国自动, 其他自动, 自建自动, 直连 ] }
 Bybit: &Bybit { type: select, proxies: [ Bybit服务 ] }
 
 # 节点筛选锚点
@@ -307,13 +307,20 @@ proxy-groups:
 
 # 规则匹配
 rules:
+  # 屏蔽 QUIC (UDP 443)，强制浏览器使用 TCP，避免 UDP 代理失败导致重复匹配
+  - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+  # 组播/广播放行 (智能家居发现协议 SSDP/mDNS)
+  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
+  - IP-CIDR,239.255.255.250/32,DIRECT,no-resolve
+  - IP-CIDR,255.255.255.255/32,DIRECT,no-resolve
+  - IP-CIDR6,ff00::/8,DIRECT,no-resolve
   # 1. 基础通信放行 (P2P打洞端口)
   - DST-PORT,3478,DIRECT
   - DST-PORT,19302,DIRECT
   # 2. 屏蔽广告
   - GEOSITE,category-ads-all, REJECT
 
-  # 2. 管理
+  # 3. 管理
   - RULE-SET,私有域名, 直连
   - RULE-SET,私有ip, 直连,no-resolve
 

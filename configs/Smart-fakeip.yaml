@@ -328,6 +328,13 @@ proxy-groups:
 
 # 规则匹配
 rules:
+  # 屏蔽 QUIC (UDP 443)，强制浏览器使用 TCP，避免 UDP 代理失败导致重复匹配
+  - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+  # 组播/广播放行 (智能家居发现协议 SSDP/mDNS)
+  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
+  - IP-CIDR,239.255.255.250/32,DIRECT,no-resolve
+  - IP-CIDR,255.255.255.255/32,DIRECT,no-resolve
+  - IP-CIDR6,ff00::/8,DIRECT,no-resolve
   # 1. 基础通信放行 (P2P打洞端口)
   - DST-PORT,3478,DIRECT
   - DST-PORT,19302,DIRECT
