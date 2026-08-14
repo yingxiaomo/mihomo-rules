@@ -706,7 +706,10 @@ def hour_features(ts_str: str):
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "Model.bin"
+# 输出 PriorModel.bin：PLD 先验模型独立于官方 weight 模型（Model.bin）。
+# 两者特征顺序不同（PLD 请求侧 30 特征 vs 官方事后统计 30 特征），
+# 必须分开存放，内核 GetPriorModel 从 PriorModel.bin 加载。
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "PriorModel.bin"
 
 LGBM_PARAMS = {
     "objective": "regression",
