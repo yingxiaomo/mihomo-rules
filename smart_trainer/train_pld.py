@@ -44,6 +44,8 @@ import re
 from pathlib import Path
 from typing import List
 
+import requests
+
 import numpy as np
 import pandas as pd
 
@@ -736,6 +738,122 @@ LOG_FILENAME = SCRIPT_DIR / "training_pld.log"
 # pipeline; for PLD we keep it minimal to stay robust on noisy reward labels.
 ROBUST_SCALER_FEATURES = ["node_sample_count"]
 
+MAX_TG_CHUNKS = 5  # Telegram 日志最大发送块数
+
+
+# ==============================================================================
+# 日志与 Telegram 通知（与 train.py 同款：详细日志 + 分块推送）
+# ==============================================================================
+def send_telegram_msg(text: str) -> None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        requests.post(url, json=data, timeout=10)
+    except Exception as e:
+        print(f"⚠️ TG 发送失败: {e}")
+
+
+def send_telegram_logs(header_msg: str) -> None:
+    """推送训练日志到 Telegram（分块，最多 MAX_TG_CHUNKS 块）。"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ Telegram 未配置，已跳过消息推送")
+        return
+
+    send_telegram_msg(header_msg)
+
+    try:
+        with open(LOG_FILENAME, "r", encoding="utf-8") as f:
+            content = f.read()
+        print(f"📋 日志文件大小: {len(content)} 字符")
+    except Exception as e:
+        content = f"无法读取日志文件: {e}"
+        print(f"⚠️ 读取日志文件失败: {e}")
+
+    chunk_size = 3500
+    total_len = len(content)
+
+    if total_len == 0:
+        send_telegram_msg("<i>(日志为空)</i>")
+        return
+
+    chunks = [content[i : i + chunk_size] for i in range(0, total_len, chunk_size)]
+
+    if len(chunks) > MAX_TG_CHUNKS:
+        chunks = chunks[:MAX_TG_CHUNKS]
+        chunks[-1] = chunks[-1][:-50] + "... (日志过长，已截断)"
+
+    for i, chunk in enumerate(chunks):
+        formatted_msg = f"<pre>{chunk}</pre>"
+        send_telegram_msg(formatted_msg)
+        if i < len(chunks) - 1:
+            time.sleep(0.5)
+
+    print(f"📨 Telegram 日志已推送 ({len(chunks)}/{min(len(chunks), MAX_TG_CHUNKS)} 块)")
+
+
+def print_separator(title: str = None) -> None:
+    logger.info("=" * 60)
+    if title:
+        logger.info(f"{title}")
+        logger.info("=" * 60)
+
+
+def check_data_balance(df: pd.DataFrame, top_ratio_threshold: float = 0.5, min_nodes: int = 5) -> bool:
+    """
+    节点分布健康检查：识别反馈循环/选择偏差风险（与 train.py 同款）。
+
+    PLD 的 D-UCB 会偏好 reward 高的节点 -> 被偏好节点产生更多样本 ->
+    数据自我强化当前偏好（"训练节点永远选不到"的统计版）。健康数据应覆盖
+    足够多的节点、且没有单一节点独占。此检查在训练前跑，异常时告警但不阻断。
+    """
+    if df is None or len(df) == 0:
+        logger.info("ℹ️ 无数据，跳过节点分布检查")
+        return False
+
+    if "node_name" not in df.columns:
+        logger.info("ℹ️ 数据缺少 node_name 列，跳过节点分布检查")
+        return True
+
+    counts = df["node_name"].value_counts()
+    total = len(df)
+    coverage = len(counts)
+    top_node = counts.index[0]
+    top_ratio = counts.iloc[0] / total
+    top5_ratio = counts.head(5).sum() / total
+
+    logger.info("📊 [节点分布检查]")
+    logger.info(f"  覆盖节点数: {coverage} | 总样本: {total}")
+    logger.info(f"  单节点最大占比: {top_ratio:.1%} ({top_node})")
+    logger.info(f"  前5节点合计占比: {top5_ratio:.1%}")
+
+    warnings = []
+    if coverage < min_nodes:
+        warnings.append(f"覆盖节点过少 ({coverage}<{min_nodes})，样本代表性不足")
+    if top_ratio > top_ratio_threshold:
+        warnings.append(
+            f"单节点占比 {top_ratio:.1%} > {top_ratio_threshold:.0%}，疑似反馈循环："
+            "被模型偏好的节点自我强化，其他节点几乎无样本。建议提高 explore-strength、"
+            "多攒几天数据，或先做节点均衡采样再训"
+        )
+    if top5_ratio > 0.9:
+        warnings.append("前5节点合计占比 >90%，节点多样性不足")
+
+    if warnings:
+        logger.warning("⚠️ 节点分布健康告警（反馈循环风险）:")
+        for w in warnings:
+            logger.warning(f"  - {w}")
+        logger.info("💡 若本批次数据来自长期运行，请斟酌是否用此数据训练")
+        return False
+    logger.info("✅ 节点分布健康，可直接训练")
+    return True
+
 
 # ==============================================================================
 # 数据加载与特征构造
@@ -921,7 +1039,13 @@ def preprocess_pld(df: pd.DataFrame):
 
 
 def train_model(X_train, y_train, X_test, y_test):
-    logger.info("--> 训练 PLD LightGBM prior 模型")
+    logger.info("--> 正在训练 PLD LightGBM prior 模型...")
+    logger.info(f"📊 训练集: {len(X_train)} 条样本, {X_train.shape[1]} 个特征")
+    logger.info(f"🧪 验证集: {len(X_test)} 条样本")
+    logger.info(f"🔄 最大迭代轮数: {LGBM_PARAMS['n_estimators']}")
+    logger.info(f"⏹️ 早停轮数: {EARLY_STOPPING_ROUNDS}")
+    logger.info(f"📈 学习率: {LGBM_PARAMS['learning_rate']}")
+
     train_data = lgb.Dataset(X_train, label=y_train)
     test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
     model = lgb.train(
@@ -930,8 +1054,19 @@ def train_model(X_train, y_train, X_test, y_test):
         valid_sets=[test_data],
         callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), lgb.log_evaluation(500)],
     )
+
+    logger.info("✅ 训练完成")
+    logger.info(f"🏆 最佳迭代轮数: {model.best_iteration}")
+
     y_pred = model.predict(X_test, num_iteration=model.best_iteration)
-    logger.info(f"📈 验证 MAE: {mean_absolute_error(y_test, y_pred):.6f}")
+    rmse_score = model.best_score.get("valid_0", {}).get("rmse", None)
+    mae_score = mean_absolute_error(y_test, y_pred)
+    if rmse_score is not None:
+        logger.info(f"📈 验证集 RMSE: {rmse_score:.6f}")
+    else:
+        logger.info("⚠️ 无法获取验证集 RMSE 分数")
+    logger.info(f"📉 验证集 MAE: {mae_score:.6f}")
+
     return model
 
 
@@ -966,11 +1101,38 @@ def save_model_and_config(model, robust_scaler, feature_order, output_path):
 
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(LOG_FILENAME), logging.StreamHandler()],
-    )
+    """train.py 同款日志：纯 message 格式（无 asctime 前缀），console + file 双输出。"""
+    log_path = Path(LOG_FILENAME)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    formatter = logging.Formatter("%(message)s")
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(LOG_FILENAME, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    lgb_logger = logging.getLogger("LightGBM")
+    lgb_logger.setLevel(logging.INFO)
+    lgb_logger.propagate = True
+
+    try:
+        lgb.register_logger(root_logger)
+    except AttributeError:
+        pass
+
+    logger.info(f"--- 训练开始: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 
 def run_training():
@@ -980,27 +1142,63 @@ def run_training():
     args = parser.parse_args()
 
     setup_logging()
-    logger.info("🚀 PLD prior 模型训练开始")
+    print_separator("PLD Prior 模型训练开始")
+
+    # 特征 Schema 校验段
+    logger.info("[特征 Schema 校验]")
+    logger.info(f"📋 PLD 特征定义数量: {len(PLD_FEATURE_ORDER)}")
+    logger.info(f"🔍 RobustScaler 配置: {len(ROBUST_SCALER_FEATURES)} 个特征")
+    untransformed = [f for f in PLD_FEATURE_ORDER if f not in ROBUST_SCALER_FEATURES]
+    if untransformed:
+        logger.info(f"⚠️ 以下特征未配置变换策略，将保持原始值: {untransformed[:10]}... (共 {len(untransformed)})")
+    logger.info("✓ 特征 Schema 校验通过")
+
     try:
         df = load_data(args.data_dir)
+
+        # 节点分布健康检查：检测反馈循环/选择偏差
+        data_healthy = check_data_balance(df)
+        if not data_healthy:
+            logger.info("⚠️ 数据分布不健康，本次训练仍在继续，但建议复核数据来源/探索率")
+
         X, y = preprocess_pld(df)
 
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
+        logger.info(f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条")
 
         # RobustScaler on the noisy count feature
         robust_cols = [c for c in ROBUST_SCALER_FEATURES if c in X_train.columns]
         robust_scaler = None
         if robust_cols:
+            logger.info("[特征变换]")
+            logger.info(f"🔄 RobustScaler 将处理 {len(robust_cols)} 个特征")
             robust_scaler = RobustScaler()
             robust_scaler.fit(X_train[robust_cols])
+            logger.info("✓ RobustScaler 已在训练集上拟合")
 
         model = train_model(X_train, y_train, X_test, y_test)
         save_model_and_config(model, robust_scaler, PLD_FEATURE_ORDER, args.output)
         logger.info(f"📦 模型已保存: {args.output}")
+
+        print_separator("训练完成")
+        logger.info(f"🎉 最终模型 '{args.output}' 已生成，随时可以部署！")
+
+        header = (
+            f"✅ <b>PLD 训练成功</b>\n"
+            f"📊 数据量: <code>{len(df)}</code> 条\n"
+            f"🔄 训练轮数: <code>{model.best_iteration}</code>\n"
+            f"🎯 模型: <code>{args.output}</code>"
+        )
+        send_telegram_logs(header)
     except Exception:
         logger.error(traceback.format_exc())
+        header = (
+            f"❌ <b>PLD 训练失败</b>\n"
+            f"⚠️ 错误原因: <code>{traceback.format_exc()[-500:]}</code>"
+        )
+        send_telegram_logs(header)
         raise
 
 
