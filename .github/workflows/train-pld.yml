@@ -59,10 +59,15 @@ jobs:
           # 只拉 PLD 数据（smart_samples*.db / smart_samples*.csv），
           # 官方 smart_weight_data.csv 不参与 PLD 训练，云端即使有残留也不进本地
           # PLD 数据在 gdrive:smart_data/pld 独立分区（official/ 预留官方数据）
-          rclone copy "${REMOTE}/pld" ./ --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO --include "smart_samples*"
+          pwd
+          rclone copy "${REMOTE}/pld" "${GITHUB_WORKSPACE}/" --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO --include "smart_samples*"
+          echo "--- listing GITHUB_WORKSPACE after pull ---"
+          ls -la "${GITHUB_WORKSPACE}/" | head -25
 
       - name: Check for PLD data files
         run: |
+          pwd
+          ls -la | head -25
           if ! ls smart_samples*.db smart_samples*.csv &> /dev/null; then
             echo "::error::No PLD data files (smart_samples*.db / smart_samples*.csv) found. Cannot proceed with training."
             exit 1
