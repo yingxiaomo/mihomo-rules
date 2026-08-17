@@ -66,9 +66,10 @@ jobs:
 
       - name: Check for PLD data files
         run: |
-          pwd
-          ls -la | head -25
-          if ! ls smart_samples*.db smart_samples*.csv &> /dev/null; then
+          # compgen only lists files that actually match; a bare "ls *.db *.csv"
+          # fails (exit != 0) when one of the globs has no match, which wrongly
+          # looked like "no data" even though smart_samples.db was present.
+          if [ -z "$(compgen -G 'smart_samples*.db'; compgen -G 'smart_samples*.csv')" ]; then
             echo "::error::No PLD data files (smart_samples*.db / smart_samples*.csv) found. Cannot proceed with training."
             exit 1
           fi
