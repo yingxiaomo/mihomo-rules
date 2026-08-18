@@ -25,6 +25,16 @@ component/smart/lightgbm.PriorModel 使用，与在线 reward EMA 及探索项�
 [transforms] 段（node_sample_count 的 RobustScaler）由内核 PriorModel 在
 推理时应用。
 
+样本权重 `sample_weight`：内核（dev-smart 双通道版）collector 对每条连接
+写入按下载量对数计算的权重（512KiB→1.0，5MB→3.5，100MB→7.7，1GB→11.0），
+使「大流量 = 黄金数据」真正体现在 LightGBM 拟合中，网页小流量不再以
+数量淹没大流量样本。旧数据/旧 CSV 无该列时自动等权 1.0。
+
+双通道标签：内核 PLDRecord 现在按流量拆两个独立 reward 通道（小流量延迟
+通道 / 大流量吞吐通道），collector 写入的 reward 是本次连接所属通道的
+EMA。模型特征中的 domain_traffic_level / traffic_class 让先验在同一空间
+区分「大流量场景谁快 / 小流量场景谁稳」。
+
 本脚本与 train.py（官方 30 特征、weight 标签训练器）并存：
   - train.py       -> 官方版内核（uselightgbm 链路），发布 smart-model
   - train_pld.py   -> 魔改内核（usepld/PLD 链路），发布 smart-pld-model
@@ -1019,7 +1029,7 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def preprocess_pld(df: pd.DataFrame):
-    logger.info("[步骤2] 构建 PLD 特征 + reward 目标")
+    logger.info("[步骤2] 构建 PLD 特征 + reward 目标 + sample_weight 样本权重")
     df["reward"] = pd.to_numeric(df["reward"], errors="coerce")
     # 只保留有有效 reward 的样本
     df = df[df["reward"].notna()].copy()
@@ -1030,15 +1040,26 @@ def preprocess_pld(df: pd.DataFrame):
     X = feats[PLD_FEATURE_ORDER]
     y = df["reward"]
 
-    # 剔除特征/目标 NaN
-    mask = X.notna().all(axis=1) & y.notna()
+    # 样本权重：新内核（dev-smart 双通道版）collector 的 sample_weight 列
+    # （下载量对数权重，见内核 smart.SampleWeightFromMB），大流量样本天然
+    # 占优、网页小流量不靠数量淹没训练。旧数据/旧 CSV 无该列时等权 1.0。
+    if "sample_weight" in df.columns:
+        w = pd.to_numeric(df["sample_weight"], errors="coerce").fillna(1.0).clip(lower=0.001)
+        logger.info(f"⚖️ 使用样本权重：均值 {w.mean():.3f}，95 分位 {w.quantile(0.95):.3f}，最大 {w.max():.3f}")
+    else:
+        w = pd.Series(1.0, index=df.index)
+        logger.info("⚖️ 数据无 sample_weight 列（旧数据），等权 1.0")
+
+    # 剔除特征/目标/权重 NaN
+    mask = X.notna().all(axis=1) & y.notna() & w.notna()
     X = X[mask]
     y = y[mask]
+    w = w[mask]
     logger.info(f"🧹 有效样本: {len(X)}  特征: {len(PLD_FEATURE_ORDER)}")
-    return X, y
+    return X, y, w
 
 
-def train_model(X_train, y_train, X_test, y_test):
+def train_model(X_train, y_train, w_train, X_test, y_test, w_test):
     logger.info("--> 正在训练 PLD LightGBM prior 模型...")
     logger.info(f"📊 训练集: {len(X_train)} 条样本, {X_train.shape[1]} 个特征")
     logger.info(f"🧪 验证集: {len(X_test)} 条样本")
@@ -1046,8 +1067,8 @@ def train_model(X_train, y_train, X_test, y_test):
     logger.info(f"⏹️ 早停轮数: {EARLY_STOPPING_ROUNDS}")
     logger.info(f"📈 学习率: {LGBM_PARAMS['learning_rate']}")
 
-    train_data = lgb.Dataset(X_train, label=y_train)
-    test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+    train_data = lgb.Dataset(X_train, label=y_train, weight=w_train)
+    test_data = lgb.Dataset(X_test, label=y_test, weight=w_test, reference=train_data)
     model = lgb.train(
         LGBM_PARAMS,
         train_data,
@@ -1161,10 +1182,10 @@ def run_training():
         if not data_healthy:
             logger.info("⚠️ 数据分布不健康，本次训练仍在继续，但建议复核数据来源/探索率")
 
-        X, y = preprocess_pld(df)
+        X, y, w = preprocess_pld(df)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
+            X, y, w, test_size=0.2, random_state=42
         )
         logger.info(f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条")
 
@@ -1178,7 +1199,7 @@ def run_training():
             robust_scaler.fit(X_train[robust_cols])
             logger.info("✓ RobustScaler 已在训练集上拟合")
 
-        model = train_model(X_train, y_train, X_test, y_test)
+        model = train_model(X_train, y_train, w_train, X_test, y_test, w_test)
         save_model_and_config(model, robust_scaler, PLD_FEATURE_ORDER, args.output)
         logger.info(f"📦 模型已保存: {args.output}")
 
