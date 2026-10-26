@@ -1028,6 +1028,43 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# 内核吞吐通道 bug 修复部署时刻（2026-10-26T15:27:00Z，内核 9ec464d1f，
+# 修复 commit yingxiaomo/mihomo@9ec464d1f"drop the bogus penalty"）。
+# 修复前的旧内核把延迟通道累计样本数当"重复失败惩罚"计入大流量 reward
+# （-0.1*(n-1)，n 为该节点几千计的样本数），结果是成熟节点上所有 >=512KB
+# 连接不分成败一律被 clamp 到 -2.0。实测样本库（2026-10-26 快照）：
+# 0.5-5MB 样本 93.8%、5-50MB 样本 100% 的 reward 为 -2，且这些样本的
+# sample_weight 天然最高（2.69 / 9.09），不剔除会把先验模型系统性地
+# 教成"下载越大越差"。
+# 无法从数据上区分"真实大流量失败"与"bug 造成的误判"（两者都是 -2），
+# 因此按部署时刻截断：部署前的大流量 -2 样本一律丢弃；部署后的保留，
+# 因为新内核只在连接真实失败（FillFailure）时才给出大流量 -2。
+LEGACY_BUG_CUTOFF_TS = 1793028420
+
+
+def drop_legacy_poisoned_samples(df: pd.DataFrame) -> pd.DataFrame:
+    """剔除旧内核吞吐通道 bug 产生的大流量 -2 污染样本（preprocess 前调用）。"""
+    big = df["download_mb"] >= 0.5
+    floored = df["reward"] <= -1.99
+    if "ts" in df.columns:
+        ts = pd.to_numeric(df["ts"], errors="coerce").fillna(0)
+        poisoned = big & floored & (ts < LEGACY_BUG_CUTOFF_TS)
+    else:
+        # 无时间戳的旧数据源无法截断，同样按全部大流量 -2 剔除（宁可损失
+        # 少量真实失败样本，也不让 -2 桶坐大）
+        poisoned = big & floored
+    n = int(poisoned.sum())
+    if n == 0:
+        logger.info("🧹 吞吐通道污染样本: 0 条，无需剔除")
+        return df
+    logger.info(
+        f"🧹 剔除旧内核大流量 -2 污染样本 {n} 条 "
+        f"(download_mb>=0.5 & reward<=-1.99, 截止 {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(LEGACY_BUG_CUTOFF_TS))}); "
+        f"剩余 {len(df) - n} 条"
+    )
+    return df[~poisoned].copy()
+
+
 def preprocess_pld(df: pd.DataFrame):
     logger.info("[步骤2] 构建 PLD 特征 + reward 目标 + sample_weight 样本权重")
     df["reward"] = pd.to_numeric(df["reward"], errors="coerce")
@@ -1035,6 +1072,8 @@ def preprocess_pld(df: pd.DataFrame):
     df = df[df["reward"].notna()].copy()
     if len(df) == 0:
         raise ValueError("没有带有效 reward 的样本")
+
+    df = drop_legacy_poisoned_samples(df)
 
     feats = build_plf_features(df)
     X = feats[PLD_FEATURE_ORDER]
