@@ -43,6 +43,7 @@ EMA。模型特征中的 domain_traffic_level / traffic_class 让先验在同一
 
 import argparse
 import glob
+import html
 import logging
 import os
 import sys
@@ -765,7 +766,12 @@ def send_telegram_msg(text: str) -> None:
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=data, timeout=10)
+        # 必须检查响应：parse_mode=HTML 下文本含未转义的 < / > 时 Telegram 返回
+        # 400 拒收整条消息（曾致含 "reward<=-1.99" 的日志分块静默消失两周），
+        # requests 不抛异常，唯有响应体可见。
+        resp = requests.post(url, json=data, timeout=10)
+        if resp.status_code != 200:
+            print(f"⚠️ TG 发送失败 (HTTP {resp.status_code}): {resp.text[:300]}")
     except Exception as e:
         print(f"⚠️ TG 发送失败: {e}")
 
@@ -800,7 +806,9 @@ def send_telegram_logs(header_msg: str) -> None:
         chunks[-1] = chunks[-1][:-50] + "... (日志过长，已截断)"
 
     for i, chunk in enumerate(chunks):
-        formatted_msg = f"<pre>{chunk}</pre>"
+        # 日志是纯文本，可能含比较符（如 "reward<=-1.99"）等 HTML 非法字符，
+        # 必须转义后才能放进 <pre>，否则整条消息被 Telegram 400 拒收
+        formatted_msg = f"<pre>{html.escape(chunk)}</pre>"
         send_telegram_msg(formatted_msg)
         if i < len(chunks) - 1:
             time.sleep(0.5)
@@ -1302,7 +1310,7 @@ def run_training():
         logger.error(traceback.format_exc())
         header = (
             f"❌ <b>PLD 训练失败</b>\n"
-            f"⚠️ 错误原因: <code>{traceback.format_exc()[-500:]}</code>"
+            f"⚠️ 错误原因: <code>{html.escape(traceback.format_exc()[-500:])}</code>"
         )
         send_telegram_logs(header)
         raise
