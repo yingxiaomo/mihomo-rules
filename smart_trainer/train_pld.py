@@ -64,7 +64,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler, RobustScaler
 
 logger = logging.getLogger(__name__)
@@ -1102,6 +1102,17 @@ def preprocess_pld(df: pd.DataFrame):
     X = feats[PLD_FEATURE_ORDER]
     y = df["reward"]
 
+    # 验证集分组键：(target, node) 二元组。随机按行拆分会让同一组合同时出现在
+    # 训练与验证集，模型靠 node_hash/target_hash 记忆组合即可刷低验证损失——
+    # 实测 25k 干净样本因此训练到 7175 轮不早停（模型 68MB，推理成本 3.8 倍），
+    # RMSE 0.039 全是泄漏幻觉。按组合拆分后验证集只含未见过的新组合，早停在
+    # 真实泛化点上触发。
+    groups = (
+        df["target"].fillna("").astype(str)
+        + "\x00"
+        + df["node_name"].astype(str)
+    )
+
     # 样本权重：新内核（dev-smart 双通道版）collector 的 sample_weight 列
     # （下载量对数权重，见内核 smart.SampleWeightFromMB），大流量样本天然
     # 占优、网页小流量不靠数量淹没训练。旧数据/旧 CSV 无该列时等权 1.0。
@@ -1113,12 +1124,13 @@ def preprocess_pld(df: pd.DataFrame):
         logger.info("⚖️ 数据无 sample_weight 列（旧数据），等权 1.0")
 
     # 剔除特征/目标/权重 NaN
-    mask = X.notna().all(axis=1) & y.notna() & w.notna()
+    mask = X.notna().all(axis=1) & y.notna() & w.notna() & groups.notna()
     X = X[mask]
     y = y[mask]
     w = w[mask]
+    groups = groups[mask]
     logger.info(f"🧹 有效样本: {len(X)}  特征: {len(PLD_FEATURE_ORDER)}")
-    return X, y, w
+    return X, y, w, groups
 
 
 def train_model(X_train, y_train, w_train, X_test, y_test, w_test):
@@ -1244,12 +1256,19 @@ def run_training():
         if not data_healthy:
             logger.info("⚠️ 数据分布不健康，本次训练仍在继续，但建议复核数据来源/探索率")
 
-        X, y, w = preprocess_pld(df)
+        X, y, w, groups = preprocess_pld(df)
 
-        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-            X, y, w, test_size=0.2, random_state=42
+        # 按 (target, node) 组合拆分训练/验证集，杜绝组合泄漏（见 preprocess_pld 注释）
+        from sklearn.model_selection import GroupShuffleSplit
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        train_idx, test_idx = next(gss.split(X, y, groups))
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        w_train, w_test = w.iloc[train_idx], w.iloc[test_idx]
+        logger.info(
+            f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条 "
+            f"(组合拆分: 训练 {groups.iloc[train_idx].nunique()} 组 / 验证 {groups.iloc[test_idx].nunique()} 组)"
         )
-        logger.info(f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条")
 
         # RobustScaler on the noisy count feature。
         # 注意：必须把变换实际应用进训练/验证数据 —— 模型文件把 center/scale
