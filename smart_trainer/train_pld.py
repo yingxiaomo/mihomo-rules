@@ -901,10 +901,14 @@ def load_data(data_dir: Path) -> pd.DataFrame:
                 conn = sqlite3.connect(f)
                 df = pd.read_sql("SELECT * FROM samples", conn)
                 conn.close()
-                # SQLite 的 ts 是 unix 秒 → 归一化成与 CSV 一致的 RFC3339 字符串
+                # SQLite 的 ts 是 unix 秒（UTC）。内核 hour_sin/cos/is_peak 用
+                # 路由器本地时间（prior.go ExtractHourCyclic(now)，本地 UTC+8），
+                # 必须换算到同一时区，否则训练/推理的小时特征相差 8 小时。
                 if "ts" in df.columns and "timestamp" not in df.columns:
                     df["timestamp"] = (
                         pd.to_datetime(df["ts"], unit="s")
+                        .dt.tz_localize("UTC")
+                        .dt.tz_convert("Asia/Shanghai")
                         .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
                     )
                 dfs.append(df)
@@ -999,10 +1003,21 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 域名流量档位（feature 20）：内置表优先（强语义，视频 CDN 子域），
     # 未命中则按 target 聚合 download_mb 均值计算实测画像，冷启动为 0。
+    # SQLite 的 download_mb/maxdownloadrate_kb 是 log1p 特征（内核 prepareFeatures
+    # 写库前做 math.Log1p），必须先 expm1 反解成真实 MB/KBps，才能与内核
+    # UpdateTargetTrafficLevel 的真实值阈值（0.5MiB / 4MiB / 8192KBps）对齐。
     if "download_mb" in df.columns and "target" in df.columns:
         tg_key = df["target"].fillna("").astype(str)
-        tg_avg = df.groupby(tg_key)["download_mb"].mean()
-        tg_peak = df.groupby(tg_key)["maxdownloadrate_kb"].max() if "maxdownloadrate_kb" in df.columns else None
+        real_mb = np.expm1(
+            pd.to_numeric(df["download_mb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        )
+        tg_avg = pd.Series(real_mb.values, index=tg_key.values).groupby(level=0).mean()
+        tg_peak = None
+        if "maxdownloadrate_kb" in df.columns:
+            real_kbps = np.expm1(
+                pd.to_numeric(df["maxdownloadrate_kb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            )
+            tg_peak = pd.Series(real_kbps.values, index=tg_key.values).groupby(level=0).max()
         target_level = {}
         for tg, v in tg_avg.items():
             pk = 0.0
@@ -1043,8 +1058,16 @@ LEGACY_BUG_CUTOFF_TS = 1793028420
 
 
 def drop_legacy_poisoned_samples(df: pd.DataFrame) -> pd.DataFrame:
-    """剔除旧内核吞吐通道 bug 产生的大流量 -2 污染样本（preprocess 前调用）。"""
-    big = df["download_mb"] >= 0.5
+    """剔除旧内核吞吐通道 bug 产生的大流量 -2 污染样本（preprocess 前调用）。
+
+    SQLite 的 download_mb 列是 log1p 特征（内核 prepareFeatures 写库前做
+    math.Log1p），0.5MiB 大流量边界必须先 expm1 反解再比较，否则实际边界
+    漂移到 0.649MiB（真实 0.512~0.649MiB 的污染样本会漏剔）。
+    """
+    real_dl_mb = np.expm1(
+        pd.to_numeric(df["download_mb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    )
+    big = real_dl_mb >= 0.5
     floored = df["reward"] <= -1.99
     if "ts" in df.columns:
         ts = pd.to_numeric(df["ts"], errors="coerce").fillna(0)
@@ -1228,15 +1251,19 @@ def run_training():
         )
         logger.info(f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条")
 
-        # RobustScaler on the noisy count feature
+        # RobustScaler on the noisy count feature。
+        # 注意：必须把变换实际应用进训练/验证数据 —— 模型文件把 center/scale
+        # 交给内核 prior.go ApplyTransforms 在推理时缩放特征 13，若训练只 fit
+        # 不 transform，推理端特征数值域与训练分布错位。
         robust_cols = [c for c in ROBUST_SCALER_FEATURES if c in X_train.columns]
         robust_scaler = None
         if robust_cols:
             logger.info("[特征变换]")
             logger.info(f"🔄 RobustScaler 将处理 {len(robust_cols)} 个特征")
             robust_scaler = RobustScaler()
-            robust_scaler.fit(X_train[robust_cols])
-            logger.info("✓ RobustScaler 已在训练集上拟合")
+            X_train[robust_cols] = robust_scaler.fit_transform(X_train[robust_cols])
+            X_test[robust_cols] = robust_scaler.transform(X_test[robust_cols])
+            logger.info("✓ RobustScaler 已在训练集拟合并应用到训练/验证特征（与内核推理端对齐）")
 
         model = train_model(X_train, y_train, w_train, X_test, y_test, w_test)
         save_model_and_config(model, robust_scaler, PLD_FEATURE_ORDER, args.output)
