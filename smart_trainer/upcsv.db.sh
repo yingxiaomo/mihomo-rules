@@ -1,30 +1,34 @@
 # =============================================================================
-# upcsv.db.sh — PLD 训练数据上传 + 保留期清理 + Telegram 战报（v5.1，2026-10-28）
+# upcsv.db.sh — PLD 训练数据周更上传 + 周期轮换 + Telegram 战报（v6，2026-10-28）
 #
-# 说明：只上传 PLD 数据（smart_samples.db / smart_samples.csv 回退）。
-#       官方 collectdata 的 smart_weight_data.csv（40 列、无 reward）是官方模型
-#       训练数据，不参与 PLD 训练，**绝不能上传**到 gdrive:smart_data。
+# 说明：只上传 PLD 数据。官方 collectdata 的 smart_weight_data.csv（40 列、
+#       无 reward）是官方模型训练数据，不参与 PLD 训练，**绝不能上传**。
 #
-# 2026-08-24 v3：SQLite 活跃库直接 rclone 会因 "source file is being updated"
-#   被拒传（内核持续写样本），这就是 8/18、8/23 训练 CI 失败的根因。
-#   新流程：cp 快照 → 校验快照大小 → 上传快照 → 远端校验。
-#   不再自动 delete 云端文件（曾误删未到期数据进回收站）。
+# 流程（用户确认的周期轮换设计）：
+#   1. 每周一 06:00 cron：cp 快照 → rclone copyto 上传为【带日期的独立库文件】
+#      smart_samples-YYYY-MM-DD.db → 远端校验；
+#   2. 上传成功后清理网盘：删除稳定名 smart_samples.db（其内容按构造必然
+#      ⊂ 最新日期文件，避免训练 glob 重复加载）+ 删除 14 天前的过期周期文件
+#      （--min-age 14d，只匹配日期化库文件，网盘始终保留最近两个周期）；
+#   3. 上传成功后【本地库轮换】：删除本地 smart_samples.db，内核 collector
+#      检测到文件消失后自动重建空库（"从 0 开始"），本地库最多只装 7 天数据；
+#   4. 训练侧 train-pld.yml 按 --include "smart_samples*" 下载网盘上保留的
+#      两个周期文件，train_pld.py 的 sorted(glob) + concat 天然合并为 ~14 天
+#      训练数据、无重叠。
 #
-# 2026-09-15 v4：修复上传文件名与训练工作流不匹配的 bug。
-#   旧版用 rclone copy 上传为 smart_snapshot.db，但 train-pld.yml 用
-#   --include "smart_samples*" 下载，导致训练永远拿到旧的 smart_samples.db。
-#   改用 rclone copyto 上传为 smart_samples.db，确保训练工作流能拉到最新数据。
+# 上传失败 → 不轮换、不清理，本地库继续积累（500MiB 上限可容纳约三周，
+# 连续失败也有充足余量），下周重试。
 #
-# 2026-10-28 v5：找回 CSV 时代 upcsv.sh 的保留期清理策略（CSV→SQLite 迁移时
-#   遗失，导致 smart_samples.db 一路涨到 100MB 上限附近，触顶后内核 AddSample
-#   静默停止采样且无可见告警）。上传成功并远端校验通过后，清理本地库 14 天前
-#   旧样本（= 保留两个上传周期）并 VACUUM；上传失败绝不删数据。
-#   顺带修复远端校验字节数的显示单位（原版把字节当 KB 除了一次）。
-#
-# 2026-10-28 v5.1：找回 CSV 时代遗失的 Telegram 战报（v3 迁移时把硬编码凭据
-#   改成了空默认环境变量，cron 里永远为空，上传通知静默断了 6 周；且 curl 没走
-#   本地代理，TG API 从路由器直连不通）。凭据与 update_model.sh 同源，可被环境
-#   变量覆盖；TG 必须经 127.0.0.1:7890（mihomo mixed 端口）转发；失败也告警。
+# 历史：
+#   v3 (2026-08-24) cp 快照解决活跃库被 rclone 拒传；不再自动删云端文件
+#                    （曾误删未到期数据进回收站）。
+#   v4 (2026-09-15) copyto 上传为 smart_samples.db，修复与训练工作流不匹配。
+#   v5 (2026-10-28) 找回 CSV 时代的 TG 战报（v3 迁移时凭据改为空环境变量，
+#                    通知静默断了 6 周）；修复远端字节数显示单位。
+#   v6 (2026-10-28) 实现周期轮换设计：日期化上传文件名 + 网盘 14 天文件级
+#                    保留（找回 CSV 时代的云端清理语义，带 min-age 与日期
+#                    模式双保险）+ 本地库上传后从 0 开始。移除 v5 误加的
+#                    行级清理（"从 0 开始"取代一切行内删除）。
 # =============================================================================
 set -e
 
@@ -32,10 +36,10 @@ DATA_DIR=/etc/nikki/run
 DB_FILE="$DATA_DIR/smart_samples.db"
 CSV_FALLBACK="$DATA_DIR/smart_samples.csv"
 SNAPSHOT="/tmp/smart_snapshot.db"
-RETENTION_DAYS=14
 REMOTE=rclone
 RCONF=/root/.config/rclone/rclone.conf
 GDRIVE_DIR=gdrive:smart_data/pld
+DATED_NAME="smart_samples-$(date +%F).db"
 TG_TOKEN="${TG_TOKEN:-1885281278:AAE0FqQqyj_flhNxFA-0jqv7Zp_VaCt4ytM}"
 TG_CHAT_ID="${TG_CHAT_ID:-1442416543}"
 TG_PROXY="http://127.0.0.1:7890"
@@ -63,60 +67,39 @@ if [ -f "$DB_FILE" ]; then
   # 一致性快照：绕开 "source file is being updated" 拒传
   cp "$DB_FILE" "$SNAPSHOT"
   SNAP_KB=$(du -k "$SNAPSHOT" | awk '{print $1}')
-  # v4: copyto 上传为 smart_samples.db，与 train-pld.yml 的 --include "smart_samples*" 匹配
-  "$REMOTE" copyto "$SNAPSHOT" "$GDRIVE_DIR/smart_samples.db" --config "$RCONF" --transfers=1 --log-level ERROR
-  REMOTE_SIZE=$(rclone lsjson "$GDRIVE_DIR/smart_samples.db" --config "$RCONF" --files-only 2>/dev/null | grep -o '"Size":[0-9]*' | head -1 | cut -d: -f2)
+  # 上传为【带日期的独立库文件】（同日重跑幂等覆盖）
+  "$REMOTE" copyto "$SNAPSHOT" "$GDRIVE_DIR/$DATED_NAME" --config "$RCONF" --transfers=1 --log-level ERROR
+  REMOTE_SIZE=$(rclone lsjson "$GDRIVE_DIR/$DATED_NAME" --config "$RCONF" --files-only 2>/dev/null | grep -o '"Size":[0-9]*' | head -1 | cut -d: -f2)
   if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" -gt 0 ]; then
-    MSG="<b>🛰️ PLD 样本库已同步</b>
---------------------
-📦 本地库: $((SIZE_KB/1024)) MB（快照 $((SNAP_KB/1024)) MB）
-☁️ 云端校验: $((REMOTE_SIZE/1024/1024)) MB"
     rm -f "$SNAPSHOT"
-    # v5: 上传成功后才清理本地旧样本（保留 14 天 = 两个上传周期）
-    CLEAN_MSG=$(python3 - "$DB_FILE" "$RETENTION_DAYS" <<'PYEOF'
-import sqlite3, sys, time
-db_path, days = sys.argv[1], int(sys.argv[2])
-cutoff = int(time.time()) - days * 86400
-db = sqlite3.connect(db_path, timeout=60)
-db.execute("PRAGMA busy_timeout=60000")
-cur = db.cursor()
-n = cur.execute("SELECT COUNT(*) FROM samples WHERE ts < ?", (cutoff,)).fetchone()[0]
-if n > 0:
-    cur.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
-    db.commit()
-    t0 = time.time()
-    db.execute("VACUUM")
-    db.commit()
-    print("已清理 %d 条 %d 天前旧样本并 VACUUM (%.1fs), 截止 %s UTC" % (n, days, time.time()-t0, time.strftime('%Y-%m-%d %H:%M', time.gmtime(cutoff))))
-else:
-    print("无 %d 天前旧样本, 无需清理" % days)
-db.close()
-PYEOF
-)
-    MSG="$MSG
-🧹 保留期清理: ${CLEAN_MSG}"
-    if [ -f "$CSV_FALLBACK" ]; then
-      "$REMOTE" copyto "$CSV_FALLBACK" "$GDRIVE_DIR/smart_samples.csv" --config "$RCONF" --transfers=1 --log-level ERROR
-      MSG="$MSG
-📄 smart_samples.csv 已同步"
-    fi
+    # 网盘清理（仅在日期文件上传校验成功后执行）：
+    #   a) 稳定名 smart_samples.db：内容按构造 ⊂ 刚上传的日期文件，删除以防
+    #      训练 glob 重复加载（首次迁移时清掉存量，之后本名不复存在）；
+    #   b) --min-age 14d + 日期化模式：删除过期周期，保留最近两个周期。
+    "$REMOTE" delete "$GDRIVE_DIR" --config "$RCONF" --include "smart_samples.db" --log-level ERROR || true
+    "$REMOTE" delete "$GDRIVE_DIR" --config "$RCONF" --min-age 14d --include "smart_samples-2*.db" --log-level ERROR || true
+    OLD_LEFT=$(rclone lsjson "$GDRIVE_DIR" --config "$RCONF" --files-only 2>/dev/null | grep -c '"Name":"smart_samples' || true)
+    # 本地库轮换：删除后内核 collector 检测到文件消失自动重建空库（从 0 开始）
+    rm -f "$DB_FILE"
+    MSG="<b>🛰️ PLD 样本库周更完成</b>
+--------------------
+📦 本轮归档: <b>$DATED_NAME</b>（$((SNAP_KB/1024)) MB，远端校验 $((REMOTE_SIZE/1024/1024)) MB）
+☁️ 网盘保留: ${OLD_LEFT} 个周期文件（>14 天已清）
+🔄 本地库已从 0 开始新周期"
     send_telegram "$MSG"
-    MSG="$MSG
-✅ 上传完成"
+    echo "[upcsv.db] $MSG"
+    exit 0
   else
     send_telegram "❌ <b>PLD 样本库上传失败</b>
 --------------------
-⚠️ 远端校验失败 (remote_size=${REMOTE_SIZE})，请检查 rclone/网络"
+⚠️ 远端校验失败 (remote_size=${REMOTE_SIZE})，本地库未轮换，下周重试"
     MSG="警告：上传后远端校验失败 (remote_size=$REMOTE_SIZE)"
     exit 1
   fi
 fi
 
-if [ -z "$MSG" ]; then
-  MSG="警告：$DB_FILE / $CSV_FALLBACK 均不存在"
-  send_telegram "❌ <b>PLD 样本库上传失败</b>
+MSG="警告：$DB_FILE 不存在"
+send_telegram "❌ <b>PLD 样本库上传失败</b>
 --------------------
-⚠️ $DB_FILE 与 $CSV_FALLBACK 均不存在"
-fi
-
+⚠️ $DB_FILE 不存在"
 echo "[upcsv.db] $MSG"
