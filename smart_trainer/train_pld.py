@@ -938,6 +938,21 @@ def load_data(data_dir: Path) -> pd.DataFrame:
     if not dfs:
         raise ValueError("无可用数据（所有文件缺 PLD 必需列）")
     merged = pd.concat(dfs, ignore_index=True)
+
+    # 采样排除（2026-11-07）：基础设施/流量性质噪声不参与训练。
+    # - '*.doh.pubdefault'：内核自身 DNS 引导的快速重试连接；服务失活检测
+    #   （c883c323）上线后其失败结算还会写入失败样本——特征反映的是基础设施
+    #   噪声而非节点质量。
+    # - 'RuleSet [谷歌FCM]'：Android 推送长连接，几乎全部 no-dl（reward 均值
+    #   ≈ -1.79），是流量性质而非节点质量，全量负标签只稀释训练。
+    # 排除与节点无关：这些目标上任何节点的样本都一并丢弃。
+    mask_doh = merged["target"].astype(str).str.contains(".doh.", regex=False, na=False)
+    mask_fcm = merged["target"].astype(str).str.contains("谷歌FCM", regex=False, na=False)
+    n_doh, n_fcm = int(mask_doh.sum()), int(mask_fcm.sum())
+    if n_doh or n_fcm:
+        merged = merged[~(mask_doh | mask_fcm)].reset_index(drop=True)
+        logger.info(f"🧹 采样排除 {n_doh + n_fcm} 条噪声目标（DoH 引导 {n_doh} + FCM 推送 {n_fcm}），剩 {len(merged)} 条")
+
     logger.info(f"📊 加载 {len(merged)} 条")
     return merged
 
