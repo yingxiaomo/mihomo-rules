@@ -1007,7 +1007,9 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     # (target, node) 分组累计（每个目标站点各自的节点表现）。旧 CSV 无 target
     # 列（内核旧版 collector 输出）时回退为仅按 node 分组。
     if "target" in df.columns:
-        group_key = df["target"].fillna("").astype(str) + "\x00" + df["node_name"].astype(str)
+        # \x1f 而非 \x00：pandas 3.x 的字符串拼接会静默吞掉 NUL（实测 3.1.1），
+        # \x1f（单元分隔符）在 pandas 2/3 都能存活，避免组键退化为直接拼接。
+        group_key = df["target"].fillna("").astype(str) + "\x1f" + df["node_name"].astype(str)
     else:
         group_key = df["node_name"].astype(str)
     for _, g in df.groupby(group_key, sort=False):
@@ -1132,7 +1134,7 @@ def preprocess_pld(df: pd.DataFrame):
     # 真实泛化点上触发。
     groups = (
         df["target"].fillna("").astype(str)
-        + "\x00"
+        + "\x1f"
         + df["node_name"].astype(str)
     )
 
