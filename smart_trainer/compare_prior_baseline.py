@@ -1,96 +1,121 @@
 #!/usr/bin/env python3
-"""经验贝叶斯查表基线 vs LightGBM 先验：同拆分、同验证集对比。
+"""Compare the PLD prior against the causal dual-channel online-state baseline.
 
-回答一个问题：LightGBM 先验是否真的优于简单 (target,node) 查表？
-- 沿用 train_pld 的 load_data / preprocess_pld / GroupShuffleSplit(random_state=42)
-  —— 与周期训练完全同协议。
-- EB 查表：分层收缩 pair均值 → target均值 → 全局均值（K=10，对应内核 α0/decay 语义）。
-- 查表无法泛化到训练集没见过的 (target,node) 组合——这正是模型必须挣饭吃的地方，
-  所以额外输出 seen/unseen 两个 regime 的分解。
-
-用法: python compare_prior_baseline.py <data_dir 或 .db 路径>
+Both models are evaluated on the same future 20% time slice. The baseline uses
+the exact causal ``node_reward_ema`` feature available before each validation
+event (already selected from the small/large channel by request context), and
+falls back to the training global mean while that channel is cold. Therefore it
+receives the same prior validation-period feedback as LightGBM; a frozen
+training-period group mean would be an unfair weaker comparator. The LightGBM
+path applies the RobustScaler metadata embedded in PriorModel.bin.
 """
-import logging
-import sys
+
+import argparse
 from pathlib import Path
 
+import lightgbm as lgb
 import numpy as np
-import pandas as pd
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import GroupShuffleSplit
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger()
+try:
+    from .train_pld import (
+        apply_embedded_transforms,
+        chronological_split_indices,
+        load_data,
+        preprocess_pld,
+    )
+except ImportError:  # direct script execution
+    from train_pld import (
+        apply_embedded_transforms,
+        chronological_split_indices,
+        load_data,
+        preprocess_pld,
+    )
 
-sys.path.insert(0, str(Path(__file__).parent))
-from train_pld import load_data, preprocess_pld, train_model  # noqa: E402
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_MODEL = PROJECT_ROOT / "PriorModel.bin"
 
-K_SHRINK = 10.0
+
+def weighted_metrics(y_true, y_pred, weights):
+    y = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    return {
+        "rmse": float(np.sqrt(np.average((y - pred) ** 2, weights=w))),
+        "mae": float(np.average(np.abs(y - pred), weights=w)),
+    }
 
 
-def rmse(y, p):
-    return float(np.sqrt(mean_squared_error(y, p)))
+def online_state_baseline(features, cold_fallback):
+    """Predict from the same pre-event dual-channel state exposed to the model."""
+    ema = features["node_reward_ema"].to_numpy(dtype=float)
+    observed = features["node_sample_count"].to_numpy(dtype=float) > 0.0
+    return np.where(observed, ema, float(cold_fallback))
+
+
+def print_metrics(name, y_true, y_pred, weights, mask):
+    count = int(mask.sum())
+    if count == 0:
+        print(f"  {name:<12} 0 条")
+        return
+    metrics = weighted_metrics(
+        np.asarray(y_true)[mask], np.asarray(y_pred)[mask], np.asarray(weights)[mask]
+    )
+    print(
+        f"  {name:<12} {count:>6} 条 | "
+        f"RMSE {metrics['rmse']:.6f} | MAE {metrics['mae']:.6f}"
+    )
 
 
 def main():
-    data = sys.argv[1] if len(sys.argv) > 1 else "."
-    df = load_data(Path(data))
-    X, y, w, groups = preprocess_pld(df)
+    parser = argparse.ArgumentParser(description="Compare PLD prior and dual-channel online baseline")
+    parser.add_argument("--data_dir", type=Path, default=SCRIPT_DIR / "data")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    args = parser.parse_args()
 
-    # 还原每个样本的 target/node（\x1f 分隔，pandas 3 不会吞；与 train_pld 组键同构）
-    key = (
-        df.loc[X.index, "target"].fillna("").astype(str)
-        + "\x1f"
-        + df.loc[X.index, "node_name"].astype(str)
-    )
-    assert (key.values == groups.values).all(), "键还原失败，索引未对齐"
+    if not args.model.is_file():
+        raise FileNotFoundError(f"找不到模型: {args.model}")
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    tr, te = next(gss.split(X, y, groups=groups))
-    logger.info(f"训练 {len(tr)} 条 / 验证 {len(te)} 条（组合拆分，协议同 train_pld）")
+    df = load_data(args.data_dir)
+    X, y, w, groups, event_times = preprocess_pld(df)
+    train_idx, test_idx = chronological_split_indices(event_times)
 
-    y_tr, y_te = y.iloc[tr], y.iloc[te]
-    key_tr, key_te = key.iloc[tr], key.iloc[te]
+    X_test = X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    w_train, w_test = w.iloc[train_idx], w.iloc[test_idx]
+    groups_train, groups_test = groups.iloc[train_idx], groups.iloc[test_idx]
 
-    # ---------- LightGBM（与 train_model 同参同早停） ----------
-    model = train_model(X.iloc[tr], y.iloc[tr], w.iloc[tr], X.iloc[te], y.iloc[te], w.iloc[te])
-    pred_lgb = model.predict(X.iloc[te])
-    logger.info(f"LightGBM 最佳迭代 {model.best_iteration}")
+    model = lgb.Booster(model_file=str(args.model))
+    transformed_test = apply_embedded_transforms(X_test, args.model)
+    prior_pred = model.predict(transformed_test, num_iteration=model.best_iteration)
 
-    # ---------- 经验贝叶斯查表（分层收缩 × 通道维度） ----------
-    # 关键：查表必须带通道维度（内核 ChannelStats 就是按通道的），否则同一
-    # (target,node) 的小/大流量 reward 混均值、方差爆炸，对查表不公平。
-    ch = (df.loc[X.index, "download_mb"] >= 1.0).map({True: "L", False: "S"})
-    key3 = key + "\x1f" + ch
-    pair3_n = key3.iloc[tr].groupby(key3.iloc[tr]).count()
-    pair3_mean = y_tr.groupby(key3.iloc[tr]).mean()
-    tgt3 = key3.iloc[tr].str.split("\x1f").str[0] + "\x1f" + key3.iloc[tr].str.split("\x1f").str[2]
-    tgt3_mean = y_tr.groupby(tgt3).mean()
-    ch_global = y_tr.groupby(ch.iloc[tr]).mean()
-    global_mean = float(y_tr.mean())
+    global_mean = float(np.average(np.asarray(y_train), weights=np.asarray(w_train)))
+    baseline_pred = online_state_baseline(X_test, global_mean)
 
-    def eb3_pred(k):
-        tgt, node, c = k.split("\x1f")
-        n = int(pair3_n.get(k, 0))
-        if n > 0:
-            return (n * float(pair3_mean[k]) + K_SHRINK * float(tgt3_mean.get(tgt + "\x1f" + c, global_mean))) / (n + K_SHRINK)
-        tk = tgt + "\x1f" + c
-        tn = int((tgt3 == tk).sum())
-        if tn > 0:
-            return (tn * float(tgt3_mean[tk]) + K_SHRINK * global_mean) / (tn + K_SHRINK)
-        return float(ch_global.get(c, global_mean))
+    seen_mask = groups_test.astype(str).isin(set(groups_train.astype(str))).to_numpy()
+    regimes = {
+        "总体": np.ones(len(test_idx), dtype=bool),
+        "已见组合": seen_mask,
+        "未见组合": ~seen_mask,
+    }
 
-    pred_eb3 = np.array([eb3_pred(k) for k in key3.iloc[te]])
-    pred_g = np.full(len(y_te), global_mean)
-    is_large = (key3.iloc[te].str.split("\x1f").str[2] == "L").values
+    print(f"训练 {len(train_idx)} 条，未来验证 {len(test_idx)} 条")
+    print(f"模型: {args.model}")
+    print("\nLightGBM prior（已应用模型内嵌变换）")
+    for name, mask in regimes.items():
+        print_metrics(name, y_test, prior_pred, w_test, mask)
 
-    logger.info("")
-    logger.info(f"{'预测器':<28}{'整体RMSE':>10}{'小流量':>10}{'大流量':>10}")
-    for name, p in [("全局均值", pred_g), ("EB 查表(3维分层)", pred_eb3), ("LightGBM 先验", pred_lgb)]:
-        r_all = rmse(y_te, p)
-        r_s = rmse(y_te[~is_large], p[~is_large]) if (~is_large).any() else float("nan")
-        r_l = rmse(y_te[is_large], p[is_large]) if is_large.any() else float("nan")
-        logger.info(f"{name:<28}{r_all:>10.4f}{r_s:>10.4f}{r_l:>10.4f}")
+    print("\n因果双通道在线 Reward EMA baseline（冷启动回退训练期全局均值）")
+    for name, mask in regimes.items():
+        print_metrics(name, y_test, baseline_pred, w_test, mask)
+
+    prior_all = weighted_metrics(y_test, prior_pred, w_test)
+    baseline_all = weighted_metrics(y_test, baseline_pred, w_test)
+    rmse_gain = baseline_all["rmse"] - prior_all["rmse"]
+    mae_gain = baseline_all["mae"] - prior_all["mae"]
+    print("\n差值（正数 = LightGBM 更好）")
+    print(f"  RMSE 改善: {rmse_gain:.6f}")
+    print(f"  MAE  改善: {mae_gain:.6f}")
 
 
 if __name__ == "__main__":

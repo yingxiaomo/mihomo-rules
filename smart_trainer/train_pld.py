@@ -18,10 +18,13 @@ component/smart/lightgbm.PriorModel 使用，与在线 reward EMA 及探索项�
   其中 15-19 位为节点实时/语义特征：node_delay / node_reward_var /
   target_hash / node_type / group_hash）
 
-标签：使用内核 collector 写入的 `reward` 列（Stage-3 反馈折算值），而非
-旧版 `weight` 列。reward 越高代表该连接实际表现越好。节点侧 reward EMA /
-样本数特征按 (target, node) 分组计算，与内核 (group, config, target, node)
-统计键对齐；旧版 CSV 无 target 列时回退为按 node 分组。模型文件末尾附加的
+标签：使用内核 collector 写入的 `reward` 列，而非旧版 `weight` 列。该列是
+当前连接结算后所属流量通道的 Reward EMA，不是即时 reward。节点侧特征按
+时间顺序、以 (group, target, node) 为键，使用上一次已观测的通道后验作为
+当前连接的因果前态，避免把本行标签再次执行 EMA。collector 尚未记录 config
+名且可按 sample-rate 抽样，因此样本数/方差是只基于已观测样本的近似值；
+若要与在线状态逐条完全一致，需后续在 collector 中直接记录选择时前态。
+模型文件末尾附加的
 [transforms] 段（node_sample_count 的 RobustScaler）由内核 PriorModel 在
 推理时应用。
 
@@ -30,12 +33,13 @@ component/smart/lightgbm.PriorModel 使用，与在线 reward EMA 及探索项�
 使「大流量 = 黄金数据」真正体现在 LightGBM 拟合中，网页小流量不再以
 数量淹没大流量样本。旧数据/旧 CSV 无该列时自动等权 1.0。
 
-双通道标签：内核 PLDRecord 现在按流量拆两个独立 reward 通道（小流量延迟
-通道 / 大流量吞吐通道），collector 写入的 reward 是本次连接所属通道的
-EMA。模型特征中的 domain_traffic_level / traffic_class 让先验在同一空间
+双通道标签：内核 PLDRecord 按流量拆两个独立 reward 通道（小流量延迟通道 /
+大流量吞吐通道），collector 写入当前连接所属通道结算后的 EMA。训练侧按
+连接时间对该后验做一阶滞后，作为下一连接可见的因果前态；模型特征中的
+domain_traffic_level / traffic_class 让先验在同一空间
 区分「大流量场景谁快 / 小流量场景谁稳」。
 
-本脚本与 train.py（官方 30 特征、weight 标签训练器）并存：
+本脚本与 train.py（官方当前 32 特征、weight 标签训练器）并存：
   - train.py       -> 官方版内核（uselightgbm 链路），发布 smart-model
   - train_pld.py   -> 魔改内核（usepld/PLD 链路），发布 smart-pld-model
 两者特征 schema 不同，请勿混用。
@@ -65,8 +69,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +170,10 @@ def fnv1a_hash(s: str, buckets: int) -> float:
         return 0.0
     h = 2166136261  # fnvOffsetBasis
     prime = 16777619  # fnvPrime
-    for ch in s:
-        h = (h ^ ord(ch)) & 0xFFFFFFFF
+    # Go 端按 UTF-8 字节遍历字符串，不是按 Unicode code point。ASCII 两者相同，
+    # 中文节点名/策略组名若按字符遍历会产生完全不同的 hash 特征。
+    for b in s.encode("utf-8"):
+        h = (h ^ b) & 0xFFFFFFFF
         h = (h * prime) & 0xFFFFFFFF
     return float((h % buckets) + 1)
 
@@ -720,7 +725,7 @@ def hour_features(ts_str: str):
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 # 输出 PriorModel.bin：PLD 先验模型独立于官方 weight 模型（Model.bin）。
-# 两者特征顺序不同（PLD 请求侧 30 特征 vs 官方事后统计 30 特征），
+# 两者特征顺序不同（PLD 请求侧固定 30 特征 vs 官方当前 32 特征），
 # 必须分开存放，内核 GetPriorModel 从 PriorModel.bin 加载。
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "PriorModel.bin"
 
@@ -897,6 +902,7 @@ def load_data(data_dir: Path) -> pd.DataFrame:
         for f in csv_files:
             try:
                 df = pd.read_csv(f, encoding="utf-8", on_bad_lines="skip")
+                df["_source_file"] = str(Path(f).name)
                 dfs.append(df)
             except Exception as e:
                 logger.info(f"⚠️ 跳过 {f}: {e}")
@@ -906,9 +912,9 @@ def load_data(data_dir: Path) -> pd.DataFrame:
         logger.info(f"📥 选中 {len(db_files)} 个 SQLite")
         for f in db_files:
             try:
-                conn = sqlite3.connect(f)
-                df = pd.read_sql("SELECT * FROM samples", conn)
-                conn.close()
+                with sqlite3.connect(f) as conn:
+                    df = pd.read_sql("SELECT * FROM samples", conn)
+                df["_source_file"] = str(Path(f).name)
                 # SQLite 的 ts 是 unix 秒（UTC）。内核 hour_sin/cos/is_peak 用
                 # 路由器本地时间（prior.go ExtractHourCyclic(now)，本地 UTC+8），
                 # 必须换算到同一时区，否则训练/推理的小时特征相差 8 小时。
@@ -925,10 +931,16 @@ def load_data(data_dir: Path) -> pd.DataFrame:
                 continue
 
     # 必需列校验：官方 40 列 CSV（无 reward/target/node_delay/node_type）即使混入也会被拦下
-    required_cols = {"reward", "target", "node_delay", "node_type", "group_name"}
+    required_cols = {
+        "reward", "target", "node_delay", "node_type", "group_name", "node_name",
+        "asn_raw", "host_raw", "ip_raw", "geoip_raw", "port_raw", "is_udp",
+        "download_mb", "maxdownloadrate_kb", "duration_minutes", "success", "failure",
+    }
     validated = []
     for df in dfs:
         missing = required_cols - set(df.columns)
+        if "ts" not in df.columns and "timestamp" not in df.columns:
+            missing.add("ts|timestamp")
         if missing:
             logger.warning(f"⚠️ 丢弃缺列样本（缺 {sorted(missing)}，疑似官方 smart_weight_data.csv，不用于 PLD 训练）")
             continue
@@ -938,6 +950,15 @@ def load_data(data_dir: Path) -> pd.DataFrame:
     if not dfs:
         raise ValueError("无可用数据（所有文件缺 PLD 必需列）")
     merged = pd.concat(dfs, ignore_index=True)
+
+    # 周期快照可能包含重叠的 14 天保留窗口。同一数据库行会出现在多份归档中，
+    # 若直接 concat 会被重复训练。忽略来源文件名后只删除完全相同的事件；id、
+    # ts 与完整特征/元数据共同参与判定，避免把同秒发生的两条真实连接误合并。
+    dedup_cols = [c for c in merged.columns if c != "_source_file"]
+    before_dedup = len(merged)
+    merged = merged.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
+    if len(merged) != before_dedup:
+        logger.info(f"🧹 跨快照去重 {before_dedup - len(merged)} 条重叠事件")
 
     # 采样排除（2026-11-07）：基础设施/流量性质噪声不参与训练。
     # - '*.doh.pubdefault'：内核自身 DNS 引导的快速重试连接；服务失活检测
@@ -957,8 +978,73 @@ def load_data(data_dir: Path) -> pd.DataFrame:
     return merged
 
 
+def _text_value(value) -> str:
+    """Convert a scalar collector value to the exact string hashed by Go."""
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return ""
+    return str(value)
+
+
+def _numeric_scalar(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _event_seconds(df: pd.DataFrame) -> pd.Series:
+    """Return sortable event seconds with row-wise ts/timestamp fallback."""
+    values = pd.Series(np.nan, index=df.index, dtype=float)
+    if "ts" in df.columns:
+        values = pd.to_numeric(df["ts"], errors="coerce").astype(float)
+    if "timestamp" in df.columns:
+        parsed = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        timestamp_values = parsed.map(
+            lambda value: value.timestamp() if pd.notna(value) else np.nan
+        ).astype(float)
+        values = values.fillna(timestamp_values)
+    if "ts" not in df.columns and "timestamp" not in df.columns:
+        return pd.Series(np.arange(len(df), dtype=float), index=df.index)
+
+    if values.notna().any():
+        base = float(values.max()) + 1.0
+        fallback = base + np.arange(len(df), dtype=float) / max(len(df), 1)
+        return values.where(values.notna(), pd.Series(fallback, index=df.index))
+    return pd.Series(np.arange(len(df), dtype=float), index=df.index)
+
+
+def order_pld_events(df: pd.DataFrame) -> pd.DataFrame:
+    """Stable chronological order used by causal replay and validation split."""
+    ordered = df.copy()
+    ordered["_event_time"] = _event_seconds(ordered)
+    ordered["_input_order"] = np.arange(len(ordered), dtype=np.int64)
+    if "id" in ordered.columns:
+        ordered["_event_id"] = pd.to_numeric(ordered["id"], errors="coerce").fillna(ordered["_input_order"])
+    else:
+        ordered["_event_id"] = ordered["_input_order"]
+    return ordered.sort_values(
+        ["_event_time", "_event_id", "_input_order"], kind="stable"
+    ).reset_index(drop=True)
+
+
+def update_reward_ema(mean: float, variance: float, count: int, reward: float):
+    """Exact Python counterpart of smart.UpdateRewardEMA."""
+    if count == 0:
+        return float(reward), 0.0, 1
+    alpha = 0.4 / (1.0 + 0.05 * float(count))
+    diff = float(reward) - float(mean)
+    new_mean = float(mean) + alpha * diff
+    new_var = (1.0 - alpha) * (float(variance) + alpha * diff * diff)
+    return new_mean, new_var, count + 1
+
+
+def prefer_large_flow_channel(dest_level: float, traffic_class: float) -> bool:
+    """Exact counterpart of smart.PreferLargeFlowChannel."""
+    return dest_level >= 2 or traffic_class in (1, 2)
+
+
 def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
-    """从 raw CSV 行构造 PLD 30 特征。"""
+    """从按时间排序的 collector 行构造因果 PLD 30 特征。"""
     out = pd.DataFrame(index=df.index)
 
     out["asn_feature"] = df["asn_raw"].fillna("").map(extract_asn_feature)
@@ -973,20 +1059,22 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     out["is_peak"] = pk
 
     out["domain_feature"] = df["host_raw"].fillna("").map(extract_domain_feature)
-    out["geo_feature"] = df["geoip_raw"].fillna("").map(extract_geo_feature)
+    # collector 将 DstGeoIP 用 "|" 拼接；Go 推理只读取第一个国家/地区码。
+    geo_primary = df["geoip_raw"].map(_text_value).str.split("|", n=1).str[0]
+    out["geo_feature"] = geo_primary.map(extract_geo_feature)
     out["port_feature"] = df["port_raw"].fillna("0").map(extract_port_feature)
     out["traffic_class"] = [
         classify_traffic(bool(u), p)
         for u, p in zip(df["is_udp"].fillna(0).astype(int), df["port_raw"].fillna("0"))
     ]
 
-    out["asn_hash"] = [fnv1a_hash(str(v), 500) for v in df["asn_raw"]]
-    out["host_hash"] = [fnv1a_hash(str(v), 1000) for v in df["host_raw"]]
-    out["ip_hash"] = [fnv1a_hash(str(v), 10000) for v in df["ip_raw"]]
+    out["asn_hash"] = [fnv1a_hash(_text_value(v), 500) for v in df["asn_raw"]]
+    out["host_hash"] = [fnv1a_hash(_text_value(v), 1000) for v in df["host_raw"]]
+    out["ip_hash"] = [fnv1a_hash(_text_value(v), 10000) for v in df["ip_raw"]]
 
     # 站点集群 / 策略组 / 协议类型（新内核 collector 才有 node_delay/node_type 列）
-    out["target_hash"] = [fnv1a_hash(str(v), 1000) for v in df["target"]] if "target" in df.columns else 0.0
-    out["group_hash"] = [fnv1a_hash(str(v), 200) for v in df["group_name"]]
+    out["target_hash"] = [fnv1a_hash(_text_value(v), 1000) for v in df["target"]]
+    out["group_hash"] = [fnv1a_hash(_text_value(v), 200) for v in df["group_name"]]
     if "node_type" in df.columns:
         out["node_type"] = pd.to_numeric(df["node_type"], errors="coerce").fillna(0.0)
     else:
@@ -997,69 +1085,109 @@ def build_plf_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["node_delay"] = 0.0
 
-    # 节点侧：reward EMA(按 target+节点) + 样本数 + 方差 + 节点哈希
-    out["node_reward_ema"] = 0.0
-    out["node_sample_count"] = 0.0
-    out["node_reward_var"] = 0.0
-    out["node_hash"] = [fnv1a_hash(str(v), 1000) for v in df["node_name"]]
+    out["node_hash"] = [fnv1a_hash(_text_value(v), 1000) for v in df["node_name"]]
 
-    # 与内核 stats 的 (group, config, target, node) 键语义对齐：reward EMA 按
-    # (target, node) 分组累计（每个目标站点各自的节点表现）。旧 CSV 无 target
-    # 列（内核旧版 collector 输出）时回退为仅按 node 分组。
-    if "target" in df.columns:
-        # \x1f 而非 \x00：pandas 3.x 的字符串拼接会静默吞掉 NUL（实测 3.1.1），
-        # \x1f（单元分隔符）在 pandas 2/3 都能存活，避免组键退化为直接拼接。
-        group_key = df["target"].fillna("").astype(str) + "\x1f" + df["node_name"].astype(str)
+    # collector 的 reward 已是当前连接结算后所属通道的 Reward EMA，不是即时
+    # reward。特征必须先读取上一次已观测后验，再把本行后验写回实际流量通道；
+    # 绝不能再次把 reward 当原始值执行 EMA（那会形成“双重 EMA”）。
+    # domain_traffic_level 也模拟内核“一次选路延迟”：BuildRequestFeatures 先读
+    # 旧缓存，本次 computePLDWeights 才用此前累计统计刷新缓存，供下一连接使用。
+    rewards = pd.to_numeric(df["reward"], errors="coerce").fillna(0.0).to_numpy()
+    real_mb = np.expm1(
+        pd.to_numeric(df["download_mb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    ).to_numpy()
+    if "maxdownloadrate_kb" in df.columns:
+        real_kbps = np.expm1(
+            pd.to_numeric(df["maxdownloadrate_kb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        ).to_numpy()
     else:
-        group_key = df["node_name"].astype(str)
-    for _, g in df.groupby(group_key, sort=False):
-        rewards = pd.to_numeric(g["reward"], errors="coerce").fillna(0).values
-        ema = 0.0
-        alpha = 0.4
-        emas = []
-        for r in rewards:
-            ema = r if ema == 0 else (ema * (1 - alpha) + r * alpha)
-            emas.append(ema)
-        out.loc[g.index, "node_reward_ema"] = np.clip(emas, 0, 1)
-        out.loc[g.index, "node_sample_count"] = np.log1p(np.arange(1, len(g) + 1))
-        # reward 样本方差（同组窗口），与内核 RewardVar 的"不确定性"语义对齐
-        var = float(np.var(rewards)) if len(rewards) > 1 else 0.0
-        out.loc[g.index, "node_reward_var"] = min(max(var, 0.0), 2.0) / 2.0
+        real_kbps = np.zeros(len(df), dtype=float)
+    real_duration_sec = np.expm1(
+        pd.to_numeric(df["duration_minutes"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    ).to_numpy() * 60.0
 
-    # 域名流量档位（feature 20）：内置表优先（强语义，视频 CDN 子域），
-    # 未命中则按 target 聚合 download_mb 均值计算实测画像，冷启动为 0。
-    # SQLite 的 download_mb/maxdownloadrate_kb 是 log1p 特征（内核 prepareFeatures
-    # 写库前做 math.Log1p），必须先 expm1 反解成真实 MB/KBps，才能与内核
-    # UpdateTargetTrafficLevel 的真实值阈值（0.5MiB / 4MiB / 8192KBps）对齐。
-    if "download_mb" in df.columns and "target" in df.columns:
-        tg_key = df["target"].fillna("").astype(str)
-        real_mb = np.expm1(
-            pd.to_numeric(df["download_mb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    node_state = {}
+    counter_state = {}
+    target_history = {}
+    target_cache = {}
+    node_ema, node_count, node_var, traffic_levels = [], [], [], []
+
+    for pos, (_, row) in enumerate(df.iterrows()):
+        group = _text_value(row.get("group_name", ""))
+        target = _text_value(row.get("target", ""))
+        node = _text_value(row.get("node_name", ""))
+        host = _text_value(row.get("host_raw", ""))
+
+        built_in = builtin_traffic_level(host)
+        level = built_in or target_cache.get(target, 0)
+        traffic_levels.append(float(level))
+
+        large_mode = prefer_large_flow_channel(level, float(out.iloc[pos]["traffic_class"]))
+        state = node_state.setdefault(
+            (group, target, node),
+            {"small": (0.0, 0.0, 0), "large": (0.0, 0.0, 0)},
         )
-        tg_avg = pd.Series(real_mb.values, index=tg_key.values).groupby(level=0).mean()
-        tg_peak = None
-        if "maxdownloadrate_kb" in df.columns:
-            real_kbps = np.expm1(
-                pd.to_numeric(df["maxdownloadrate_kb"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        mean, variance, count = state["large" if large_mode else "small"]
+        node_ema.append(min(max(mean, 0.0), 1.0))
+        node_count.append(float(np.log1p(count)))
+        node_var.append(min(max(variance, 0.0), 2.0) / 2.0)
+
+        # 刷新供下一次选择读取的 target 画像（只含当前连接之前的历史）。
+        total_mb, peak_kbps, sample_count = target_history.get(target, (0.0, 0.0, 0))
+        if target and sample_count > 0:
+            target_cache[target] = traffic_level_from_avg(total_mb / sample_count, peak_kbps)
+
+        observed_mean = float(rewards[pos])
+        label_channel = "large" if real_mb[pos] >= 0.5 else "small"
+        old_mean, old_variance, old_count = state[label_channel]
+        if old_count == 0:
+            new_variance, new_count = 0.0, 1
+        else:
+            # 在连续全采样时可由相邻 EMA 反解本次即时 reward，从而重放方差；
+            # 抽样有缺口时反解值会越界，按内核 reward 合法范围截断后仅作近似。
+            alpha = 0.4 / (1.0 + 0.05 * float(old_count))
+            inferred_reward = old_mean + (observed_mean - old_mean) / alpha
+            inferred_reward = min(max(inferred_reward, -2.0), 1.0)
+            _, new_variance, new_count = update_reward_ema(
+                old_mean, old_variance, old_count, inferred_reward
             )
-            tg_peak = pd.Series(real_kbps.values, index=tg_key.values).groupby(level=0).max()
-        target_level = {}
-        for tg, v in tg_avg.items():
-            pk = 0.0
-            if tg_peak is not None and tg in tg_peak.index:
-                pk = float(tg_peak.loc[tg] or 0.0)
-            target_level[tg] = traffic_level_from_avg(float(v), pk)
-    else:
-        target_level = {}
-    # 旧版 CSV 无 target 列时退回 host_raw 作为聚合键（与内核 SmartTarget 语义近似）
-    if "target" in df.columns:
-        level_key = df["target"].fillna("").astype(str)
-    else:
-        level_key = df["host_raw"].fillna("").astype(str)
-    out["domain_traffic_level"] = [
-        builtin_traffic_level(h) or target_level.get(str(t), 0)
-        for h, t in zip(df["host_raw"].fillna(""), level_key)
-    ]
+        state[label_channel] = (observed_mean, new_variance, new_count)
+
+        # success/failure 是该 (group,target,node) 的结算后累计计数。失败计数
+        # 增长且成功计数未增长，只能先认定 connectionFailed；是否为 PLD 双通道
+        # 硬失败还必须结合下载量/持续时间排除大流量部分成功。抽样间隔内两者都
+        # 增长时保持保守，不凭猜测污染另一通道。
+        success = _numeric_scalar(row.get("success", np.nan))
+        failure = _numeric_scalar(row.get("failure", np.nan))
+        previous_counters = counter_state.get((group, target, node))
+        connection_failed = False
+        if np.isfinite(success) and np.isfinite(failure):
+            if previous_counters is None:
+                connection_failed = failure > 0 and success <= 0
+            else:
+                prev_success, prev_failure = previous_counters
+                connection_failed = failure > prev_failure and success <= prev_success
+            counter_state[(group, target, node)] = (success, failure)
+        # 内核把“异常关闭但已下载 >=0.5 MiB 且持续 >=0.5s”视为部分成功：
+        # official failure 计数会增长，但 PLD 只更新大流量通道，不能补写另一
+        # 通道 -2。只有没有形成有效大流量传输的失败才会 FillFailure 双通道。
+        partial_success = real_mb[pos] >= 0.5 and real_duration_sec[pos] >= 0.5
+        if connection_failed and not partial_success:
+            other_channel = "small" if label_channel == "large" else "large"
+            state[other_channel] = update_reward_ema(*state[other_channel], -2.0)
+
+        target_history[target] = (
+            total_mb + float(real_mb[pos]),
+            max(peak_kbps, float(real_kbps[pos])),
+            sample_count + 1,
+        )
+
+    out["node_reward_ema"] = node_ema
+    out["node_sample_count"] = node_count
+    out["node_reward_var"] = node_var
+    out["domain_traffic_level"] = traffic_levels
 
     # 保留字段 0
     for i in range(21, 30):
@@ -1094,8 +1222,8 @@ def drop_legacy_poisoned_samples(df: pd.DataFrame) -> pd.DataFrame:
     )
     big = real_dl_mb >= 0.5
     floored = df["reward"] <= -1.99
-    if "ts" in df.columns:
-        ts = pd.to_numeric(df["ts"], errors="coerce").fillna(0)
+    if "ts" in df.columns or "timestamp" in df.columns:
+        ts = _event_seconds(df)
         poisoned = big & floored & (ts < LEGACY_BUG_CUTOFF_TS)
     else:
         # 无时间戳的旧数据源无法截断，同样按全部大流量 -2 剔除（宁可损失
@@ -1123,20 +1251,25 @@ def preprocess_pld(df: pd.DataFrame):
 
     df = drop_legacy_poisoned_samples(df)
 
+    # 所有在线状态特征均依赖过去事件，必须先全局按事件时间稳定排序。后续验证集
+    # 直接取时间尾部，保证训练只看过去、验证只看未来。
+    df = order_pld_events(df)
+
     feats = build_plf_features(df)
     X = feats[PLD_FEATURE_ORDER]
     y = df["reward"]
 
-    # 验证集分组键：(target, node) 二元组。随机按行拆分会让同一组合同时出现在
-    # 训练与验证集，模型靠 node_hash/target_hash 记忆组合即可刷低验证损失——
-    # 实测 25k 干净样本因此训练到 7175 轮不早停（模型 68MB，推理成本 3.8 倍），
-    # RMSE 0.039 全是泄漏幻觉。按组合拆分后验证集只含未见过的新组合，早停在
-    # 真实泛化点上触发。
+    # 组合键只用于将时间验证集拆成 seen/unseen 两类分别报告，不再拿它随机
+    # 分组切分。线上绝大多数请求是已见组合，纯 unseen 验证会错误优化另一个
+    # 问题；全局时间切分才与“用过去预测未来”的部署目标一致。
     groups = (
-        df["target"].fillna("").astype(str)
+        df["group_name"].fillna("").astype(str)
+        + "\x1f"
+        + df["target"].fillna("").astype(str)
         + "\x1f"
         + df["node_name"].astype(str)
     )
+    event_times = df["_event_time"].astype(float)
 
     # 样本权重：新内核（dev-smart 双通道版）collector 的 sample_weight 列
     # （下载量对数权重，见内核 smart.SampleWeightFromMB），大流量样本天然
@@ -1154,8 +1287,54 @@ def preprocess_pld(df: pd.DataFrame):
     y = y[mask]
     w = w[mask]
     groups = groups[mask]
+    event_times = event_times[mask]
     logger.info(f"🧹 有效样本: {len(X)}  特征: {len(PLD_FEATURE_ORDER)}")
-    return X, y, w, groups
+    return X, y, w, groups, event_times
+
+
+def chronological_split_indices(event_times: pd.Series, test_size: float = 0.2):
+    """Return past/future positional indices for an already ordered event series."""
+    n = len(event_times)
+    if n < 2:
+        raise ValueError("至少需要 2 条有效样本才能拆分训练/验证集")
+    values = np.asarray(event_times, dtype=float)
+    if np.any(values[1:] < values[:-1]):
+        raise ValueError("事件未按时间排序，拒绝执行可能泄漏未来信息的切分")
+    cut = min(max(int(n * (1.0 - test_size)), 1), n - 1)
+    return np.arange(cut), np.arange(cut, n)
+
+
+def _weighted_metrics(y_true, y_pred, weights):
+    y_arr = np.asarray(y_true, dtype=float)
+    p_arr = np.asarray(y_pred, dtype=float)
+    w_arr = np.asarray(weights, dtype=float)
+    if len(y_arr) == 0:
+        return None
+    rmse = float(np.sqrt(np.average((y_arr - p_arr) ** 2, weights=w_arr)))
+    mae = float(np.average(np.abs(y_arr - p_arr), weights=w_arr))
+    return rmse, mae
+
+
+def log_validation_regimes(model, X_test, y_test, w_test, train_groups, test_groups):
+    """Report deployment-like overall, seen-combination and unseen-combination error."""
+    pred = model.predict(X_test, num_iteration=model.best_iteration)
+    known = set(train_groups.astype(str))
+    seen_mask = test_groups.astype(str).isin(known).to_numpy()
+    regimes = {
+        "总体": np.ones(len(X_test), dtype=bool),
+        "已见组合": seen_mask,
+        "未见组合": ~seen_mask,
+    }
+    logger.info("[时间验证集分层]")
+    for name, mask in regimes.items():
+        metrics = _weighted_metrics(
+            np.asarray(y_test)[mask], pred[mask], np.asarray(w_test)[mask]
+        )
+        if metrics is None:
+            logger.info(f"  {name}: 0 条（本批次无该 regime）")
+            continue
+        rmse, mae = metrics
+        logger.info(f"  {name}: {int(mask.sum())} 条 | 加权 RMSE {rmse:.6f} | 加权 MAE {mae:.6f}")
 
 
 def train_model(X_train, y_train, w_train, X_test, y_test, w_test):
@@ -1220,6 +1399,32 @@ def save_model_and_config(model, robust_scaler, feature_order, output_path):
     logger.info("✅ 变换配置已附加到模型末尾")
 
 
+def apply_embedded_transforms(X: pd.DataFrame, model_path: Path) -> pd.DataFrame:
+    """Apply the RobustScaler metadata embedded in a saved PriorModel.bin."""
+    text = Path(model_path).read_text(encoding="utf-8", errors="ignore")
+
+    def value(name: str):
+        match = re.search(rf"^{re.escape(name)}=(.*)$", text, flags=re.MULTILINE)
+        return match.group(1).strip() if match else ""
+
+    indices_raw = value("robust_features")
+    if not indices_raw:
+        return X.copy()
+    indices = [int(v) for v in indices_raw.split(",") if v != ""]
+    centers = [float(v) for v in value("robust_center").split(",") if v != ""]
+    scales = [float(v) for v in value("robust_scale").split(",") if v != ""]
+    if not (len(indices) == len(centers) == len(scales)):
+        raise ValueError("模型内嵌 RobustScaler 元数据长度不一致")
+    if any(i < 0 or i >= X.shape[1] for i in indices):
+        raise ValueError("模型内嵌 RobustScaler 特征索引越界")
+
+    transformed = X.copy()
+    for index, center, scale in zip(indices, centers, scales):
+        safe_scale = scale if scale != 0 else 1.0
+        transformed.iloc[:, index] = (transformed.iloc[:, index] - center) / safe_scale
+    return transformed
+
+
 def setup_logging():
     """train.py 同款日志：纯 message 格式（无 asctime 前缀），console + file 双输出。"""
     log_path = Path(LOG_FILENAME)
@@ -1281,18 +1486,17 @@ def run_training():
         if not data_healthy:
             logger.info("⚠️ 数据分布不健康，本次训练仍在继续，但建议复核数据来源/探索率")
 
-        X, y, w, groups = preprocess_pld(df)
+        X, y, w, groups, event_times = preprocess_pld(df)
 
-        # 按 (target, node) 组合拆分训练/验证集，杜绝组合泄漏（见 preprocess_pld 注释）
-        from sklearn.model_selection import GroupShuffleSplit
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, test_idx = next(gss.split(X, y, groups))
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        w_train, w_test = w.iloc[train_idx], w.iloc[test_idx]
+        # 全局时间切分：过去 80% 训练，未来 20% 验证。组合键仅用于下方
+        # seen/unseen 分层报告，不参与随机拆分。
+        train_idx, test_idx = chronological_split_indices(event_times, test_size=0.2)
+        X_train, X_test = X.iloc[train_idx].copy(), X.iloc[test_idx].copy()
+        y_train, y_test = y.iloc[train_idx].copy(), y.iloc[test_idx].copy()
+        w_train, w_test = w.iloc[train_idx].copy(), w.iloc[test_idx].copy()
         logger.info(
             f"🧠 训练集: {len(X_train)} 条 | 🧪 验证集: {len(X_test)} 条 "
-            f"(组合拆分: 训练 {groups.iloc[train_idx].nunique()} 组 / 验证 {groups.iloc[test_idx].nunique()} 组)"
+            f"(时间切分: 训练 {groups.iloc[train_idx].nunique()} 组 / 验证 {groups.iloc[test_idx].nunique()} 组)"
         )
 
         # RobustScaler on the noisy count feature。
@@ -1310,6 +1514,14 @@ def run_training():
             logger.info("✓ RobustScaler 已在训练集拟合并应用到训练/验证特征（与内核推理端对齐）")
 
         model = train_model(X_train, y_train, w_train, X_test, y_test, w_test)
+        log_validation_regimes(
+            model,
+            X_test,
+            y_test,
+            w_test,
+            groups.iloc[train_idx],
+            groups.iloc[test_idx],
+        )
         save_model_and_config(model, robust_scaler, PLD_FEATURE_ORDER, args.output)
         logger.info(f"📦 模型已保存: {args.output}")
 

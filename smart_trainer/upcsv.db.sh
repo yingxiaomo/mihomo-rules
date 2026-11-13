@@ -1,105 +1,153 @@
 # =============================================================================
-# upcsv.db.sh — PLD 训练数据周更上传 + 周期轮换 + Telegram 战报（v6，2026-10-28）
+# upcsv.db.sh — PLD 训练数据周更上传 + 周期轮换 + Telegram 战报（v8）
 #
-# 说明：只上传 PLD 数据。官方 collectdata 的 smart_weight_data.csv（40 列、
-#       无 reward）是官方模型训练数据，不参与 PLD 训练，**绝不能上传**。
+# 只上传 PLD 的 smart_samples.db / smart_samples.csv；官方
+# smart_weight_data.csv 不属于这条训练链路，绝不能上传。
 #
-# 流程（用户确认的周期轮换设计）：
-#   1. 每周一 06:00 cron：cp 快照 → rclone copyto 上传为【带日期的独立库文件】
-#      smart_samples-YYYY-MM-DD.db → 远端校验；
-#   2. 上传成功后清理网盘：删除稳定名 smart_samples.db（其内容按构造必然
-#      ⊂ 最新日期文件，避免训练 glob 重复加载）+ 删除 14 天前的过期周期文件
-#      （--min-age 14d，只匹配日期化库文件，网盘始终保留最近两个周期）；
-#   3. 上传成功后【本地库轮换】：删除本地 smart_samples.db，内核 collector
-#      检测到文件消失后自动重建空库（"从 0 开始"），本地库最多只装 7 天数据；
-#   4. 训练侧 train-pld.yml 按 --include "smart_samples*" 下载网盘上保留的
-#      两个周期文件，train_pld.py 的 sorted(glob) + concat 天然合并为 ~14 天
-#      训练数据、无重叠。
-#
-# 上传失败 → 不轮换、不清理，本地库继续积累（500MiB 上限可容纳约三周，
-# 连续失败也有充足余量），下周重试。
-#
-# 历史：
-#   v3 (2026-08-24) cp 快照解决活跃库被 rclone 拒传；不再自动删云端文件
-#                    （曾误删未到期数据进回收站）。
-#   v4 (2026-09-15) copyto 上传为 smart_samples.db，修复与训练工作流不匹配。
-#   v5 (2026-10-28) 找回 CSV 时代的 TG 战报（v3 迁移时凭据改为空环境变量，
-#                    通知静默断了 6 周）；修复远端字节数显示单位。
-#   v6 (2026-10-28) 实现周期轮换设计：日期化上传文件名 + 网盘 14 天文件级
-#                    保留（找回 CSV 时代的云端清理语义，带 min-age 与日期
-#                    模式双保险）+ 本地库上传后从 0 开始。移除 v5 误加的
-#                    行级清理（"从 0 开始"取代一切行内删除）。
+# 周期：生成一致快照 → 时间戳+进程号唯一命名上传 → 字节数校验 → 清理云端旧周期 →
+# SQLite 只删除快照已覆盖的 id 并 VACUUM；快照后的新样本始终留在活跃库。
+# CSV 无法与活跃 writer 事务协调，上传成功后保留本地累计文件，绝不冒险截断。
+# SQLite 必须通过 sqlite3 在线备份 API 取快照，禁止直接复制活跃主库。
+# CSV 回退是追加文件：仅在复制前后源文件大小稳定且快照字节数一致时放行。
 # =============================================================================
-set -e
+set -eu
 
-DATA_DIR=/etc/nikki/run
+DATA_DIR="${DATA_DIR:-/etc/nikki/run}"
 DB_FILE="$DATA_DIR/smart_samples.db"
 CSV_FALLBACK="$DATA_DIR/smart_samples.csv"
-SNAPSHOT="/tmp/smart_snapshot.db"
-REMOTE=rclone
-RCONF=/root/.config/rclone/rclone.conf
-GDRIVE_DIR=gdrive:smart_data/pld
-DATED_NAME="smart_samples-$(date +%F).db"
-TG_TOKEN="${TG_TOKEN:-1885281278:AAE0FqQqyj_flhNxFA-0jqv7Zp_VaCt4ytM}"
-TG_CHAT_ID="${TG_CHAT_ID:-1442416543}"
-TG_PROXY="http://127.0.0.1:7890"
+RCLONE_BIN="${RCLONE_BIN:-rclone}"
+RCONF="${RCONF:-/root/.config/rclone/rclone.conf}"
+GDRIVE_DIR="${GDRIVE_DIR:-gdrive:smart_data/pld}"
+MIN_SIZE_KB="${MIN_SIZE_KB:-1024}"
+TG_TOKEN="${TG_BOT_TOKEN:-${TG_TOKEN:-}}"
+TG_CHAT_ID="${TG_CHAT_ID:-}"
+TG_PROXY="${TG_PROXY:-http://127.0.0.1:7890}"
+SNAPSHOT=""
+LOCAL_SAFETY="本地数据未轮换"
+
+cleanup_snapshot() {
+  if [ -n "$SNAPSHOT" ]; then
+    rm -f "$SNAPSHOT"
+  fi
+}
+trap cleanup_snapshot EXIT
 
 send_telegram() {
   local msg="$1"
-  [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ] && return 0
-  export https_proxy="$TG_PROXY" http_proxy="$TG_PROXY"
+  if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+    return 0
+  fi
+  if [ -n "$TG_PROXY" ]; then
+    export https_proxy="$TG_PROXY" http_proxy="$TG_PROXY"
+  fi
   curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
     -d "chat_id=${TG_CHAT_ID}" \
     -d "parse_mode=HTML" \
     --data-urlencode "text=${msg}" \
     --connect-timeout 5 --max-time 15 \
     --retry 2 --retry-delay 2 >/dev/null 2>&1 || true
-  unset https_proxy http_proxy
+  if [ -n "$TG_PROXY" ]; then
+    unset https_proxy http_proxy
+  fi
 }
 
-MSG=""
+fail_upload() {
+  local reason="$1"
+  send_telegram "❌ <b>PLD 样本上传失败</b>
+--------------------
+⚠️ ${reason}；${LOCAL_SAFETY}"
+  echo "[upcsv.db] ERROR: $reason" >&2
+  exit 1
+}
+
+SOURCE_FILE=""
+DATED_NAME=""
+SOURCE_TYPE=""
+SNAPSHOT_MAX_ID=""
+RUN_ID="$(date -u +%F-%H%M%S)-$$"
 if [ -f "$DB_FILE" ]; then
-  SIZE_KB=$(du -k "$DB_FILE" | awk '{print $1}')
-  if [ "$SIZE_KB" -lt 1024 ]; then
-    echo "[upcsv.db] skip: db too small ($SIZE_KB KB)"
-    exit 1
+  SOURCE_FILE="$DB_FILE"
+  SOURCE_TYPE=db
+  SNAPSHOT="/tmp/smart_snapshot-${RUN_ID}.db"
+  DATED_NAME="smart_samples-${RUN_ID}.db"
+  command -v sqlite3 >/dev/null 2>&1 || fail_upload "缺少 sqlite3，无法安全备份活跃数据库"
+  rm -f "$SNAPSHOT"
+  if ! sqlite3 "$DB_FILE" ".timeout 5000" ".backup '$SNAPSHOT'"; then
+    fail_upload "SQLite 在线备份失败"
   fi
-  # 一致性快照：绕开 "source file is being updated" 拒传
-  cp "$DB_FILE" "$SNAPSHOT"
-  SNAP_KB=$(du -k "$SNAPSHOT" | awk '{print $1}')
-  # 上传为【带日期的独立库文件】（同日重跑幂等覆盖）
-  "$REMOTE" copyto "$SNAPSHOT" "$GDRIVE_DIR/$DATED_NAME" --config "$RCONF" --transfers=1 --log-level ERROR
-  REMOTE_SIZE=$(rclone lsjson "$GDRIVE_DIR/$DATED_NAME" --config "$RCONF" --files-only 2>/dev/null | grep -o '"Size":[0-9]*' | head -1 | cut -d: -f2)
-  if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" -gt 0 ]; then
-    rm -f "$SNAPSHOT"
-    # 网盘清理（仅在日期文件上传校验成功后执行）：
-    #   a) 稳定名 smart_samples.db：内容按构造 ⊂ 刚上传的日期文件，删除以防
-    #      训练 glob 重复加载（首次迁移时清掉存量，之后本名不复存在）；
-    #   b) --min-age 14d + 日期化模式：删除过期周期，保留最近两个周期。
-    "$REMOTE" delete "$GDRIVE_DIR" --config "$RCONF" --include "smart_samples.db" --log-level ERROR || true
-    "$REMOTE" delete "$GDRIVE_DIR" --config "$RCONF" --min-age 14d --include "smart_samples-2*.db" --log-level ERROR || true
-    OLD_LEFT=$(rclone lsjson "$GDRIVE_DIR" --config "$RCONF" --files-only 2>/dev/null | grep -c '"Name":"smart_samples' || true)
-    # 本地库轮换：删除后内核 collector 检测到文件消失自动重建空库（从 0 开始）
-    rm -f "$DB_FILE"
-    MSG="<b>🛰️ PLD 样本库周更完成</b>
---------------------
-📦 本轮归档: <b>$DATED_NAME</b>（$((SNAP_KB/1024)) MB，远端校验 $((REMOTE_SIZE/1024/1024)) MB）
-☁️ 网盘保留: ${OLD_LEFT} 个周期文件（>14 天已清）
-🔄 本地库已从 0 开始新周期"
-    send_telegram "$MSG"
-    echo "[upcsv.db] $MSG"
-    exit 0
-  else
-    send_telegram "❌ <b>PLD 样本库上传失败</b>
---------------------
-⚠️ 远端校验失败 (remote_size=${REMOTE_SIZE})，本地库未轮换，下周重试"
-    MSG="警告：上传后远端校验失败 (remote_size=$REMOTE_SIZE)"
-    exit 1
+  CHECK_RESULT=$(sqlite3 "$SNAPSHOT" 'PRAGMA quick_check;' 2>/dev/null || true)
+  [ "$CHECK_RESULT" = "ok" ] || fail_upload "SQLite 快照完整性检查失败"
+  SNAPSHOT_MAX_ID=$(sqlite3 "$SNAPSHOT" 'SELECT COALESCE(MAX(id), 0) FROM samples;' 2>/dev/null || true)
+  case "$SNAPSHOT_MAX_ID" in
+    ''|*[!0-9]*) fail_upload "无法读取 SQLite 快照最大 id" ;;
+    0) fail_upload "SQLite 快照没有可归档样本" ;;
+  esac
+elif [ -f "$CSV_FALLBACK" ]; then
+  SOURCE_FILE="$CSV_FALLBACK"
+  SOURCE_TYPE=csv
+  SNAPSHOT="/tmp/smart_snapshot-${RUN_ID}.csv"
+  DATED_NAME="smart_samples-${RUN_ID}.csv"
+  rm -f "$SNAPSHOT"
+  BEFORE_SIZE=$(wc -c < "$CSV_FALLBACK" | tr -d ' ')
+  cp "$CSV_FALLBACK" "$SNAPSHOT"
+  AFTER_SIZE=$(wc -c < "$CSV_FALLBACK" | tr -d ' ')
+  SNAP_SIZE=$(wc -c < "$SNAPSHOT" | tr -d ' ')
+  if [ "$BEFORE_SIZE" -ne "$AFTER_SIZE" ] || [ "$SNAP_SIZE" -ne "$BEFORE_SIZE" ]; then
+    fail_upload "CSV 在复制期间发生写入，请下次重试"
   fi
+  HEADER=$(sed -n '1p' "$SNAPSHOT")
+  case ",$HEADER," in *,reward,*) ;; *) fail_upload "CSV 快照缺少 reward 列" ;; esac
+  case ",$HEADER," in *,target,*) ;; *) fail_upload "CSV 快照缺少 target 列" ;; esac
+  case ",$HEADER," in *,sample_weight,*) ;; *) fail_upload "CSV 快照缺少 sample_weight 列" ;; esac
+else
+  fail_upload "$DB_FILE 与 $CSV_FALLBACK 均不存在"
 fi
 
-MSG="警告：$DB_FILE 不存在"
-send_telegram "❌ <b>PLD 样本库上传失败</b>
+SIZE_KB=$(du -k "$SNAPSHOT" | awk '{print $1}')
+[ "$SIZE_KB" -ge "$MIN_SIZE_KB" ] || fail_upload "快照过小 (${SIZE_KB} KB)"
+LOCAL_SIZE=$(wc -c < "$SNAPSHOT" | tr -d ' ')
+
+if ! "$RCLONE_BIN" copyto "$SNAPSHOT" "$GDRIVE_DIR/$DATED_NAME" \
+  --config "$RCONF" --transfers=1 --log-level ERROR; then
+  fail_upload "rclone copyto 失败"
+fi
+
+REMOTE_JSON=$("$RCLONE_BIN" lsjson "$GDRIVE_DIR/$DATED_NAME" \
+  --config "$RCONF" --files-only 2>/dev/null || true)
+REMOTE_SIZE=$(printf '%s' "$REMOTE_JSON" | \
+  sed -n 's/.*"Size":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1 || true)
+if [ -z "$REMOTE_SIZE" ] || [ "$REMOTE_SIZE" -ne "$LOCAL_SIZE" ]; then
+  fail_upload "远端字节数校验失败 (local=${LOCAL_SIZE}, remote=${REMOTE_SIZE:-missing})"
+fi
+
+"$RCLONE_BIN" delete "$GDRIVE_DIR" --config "$RCONF" \
+  --include "smart_samples.db" --include "smart_samples.csv" --log-level ERROR || true
+"$RCLONE_BIN" delete "$GDRIVE_DIR" --config "$RCONF" --min-age 14d \
+  --include "smart_samples-2*.db" --include "smart_samples-2*.csv" --log-level ERROR || true
+OLD_LEFT=$("$RCLONE_BIN" lsjson "$GDRIVE_DIR" --config "$RCONF" --files-only 2>/dev/null | \
+  grep -c '"Name":[[:space:]]*"smart_samples' || true)
+
+if [ "$SOURCE_TYPE" = db ]; then
+  # 在线备份结束后 collector 仍可追加。只清理快照覆盖的旧 id，绝不删除活跃
+  # 数据库；AUTOINCREMENT 保证快照后的新行 id 更大，不会被这次轮换误删。
+  if ! sqlite3 "$DB_FILE" ".timeout 30000" \
+    "BEGIN IMMEDIATE; DELETE FROM samples WHERE id <= $SNAPSHOT_MAX_ID; COMMIT;"; then
+    fail_upload "远端归档成功，但本地已归档行清理失败"
+  fi
+  LOCAL_SAFETY="已归档行已安全保存在远端，本地新样本仍保留"
+  if ! sqlite3 "$DB_FILE" ".timeout 30000" "VACUUM;"; then
+    fail_upload "远端归档成功且旧行已清理，但本地数据库压缩失败"
+  fi
+  ROTATION_STATUS="SQLite 已清理 id≤${SNAPSHOT_MAX_ID}；快照后新样本保留"
+else
+  ROTATION_STATUS="CSV 活跃源文件已保留（不执行不安全截断）"
+fi
+
+MSG="<b>🛰️ PLD 样本周更完成</b>
 --------------------
-⚠️ $DB_FILE 不存在"
+📦 本轮归档: <b>$DATED_NAME</b>（$((SIZE_KB/1024)) MB，远端校验 $((REMOTE_SIZE/1024/1024)) MB）
+☁️ 网盘保留: ${OLD_LEFT} 个周期文件（>14 天已清）
+🔄 ${ROTATION_STATUS}"
+send_telegram "$MSG"
 echo "[upcsv.db] $MSG"
+exit 0

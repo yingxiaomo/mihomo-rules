@@ -6,7 +6,7 @@ proxy-providers:
     interval: 3600                                                                                        # 机场订阅更新频率，单位为秒         
     proxy: DIRECT                                                                                         # 订阅更新时使用的代理名称，可选                                       
     size-limit: 0                                                                                         # 限制下载文件的最大大小，默认为 0 即不限制文件大小，单位为字节 (b)                                                        
-    age-secret-key: AGE-SECRET-KEY-1ZTQLLN0A4U3ZTT3DCZKYN0CGZEZQLWX2DFTXUWMT4ZHR0N2UG6LSW9NT0N            # 如果设置会age-secret-key尝试通过此secret解密age armor格式加密的配置文件，详细请参考：https://wiki.metacubex.one/config/proxy-providers/#age-secret-key                                                                                                      
+    age-secret-key: "AGE-SECRET-KEY-1..."                                                              # 可选；用于解密 age armor 格式配置，示例必须替换为自己的私钥：https://wiki.metacubex.one/config/proxy-providers/#age-secret-key
     header:                                                                                               # 自定义请求头，可选                                                
       User-Agent:
       - "mihomo/1.18.3"                                                                                   

@@ -36,8 +36,8 @@ DEFAULT_MODEL_PATH = PROJECT_ROOT / "Model.bin"    # 模型输出路径（默认
 
 # transform.go 特征定义文件配置
 GO_LOCAL_PATH = SCRIPT_DIR / "transform.go"       # 本地transform.go路径（默认指向脚本同目录）
-# 官方源码URL = vernesong/mihomo 官方 Alpha 分支（30 特征），供官方内核用户使用。
-# 若使用 yingxiaomo/mmihos 魔改内核（25 特征），请切换到 smart-25feat 分支或改此 URL。
+# 官方源码 URL = vernesong/mihomo Alpha 分支（当前 32 特征）。脚本动态读取
+# transform.go，不把特征数量写死；PLD 魔改内核应改用 train_pld.py。
 GO_REMOTE_URL = "https://raw.githubusercontent.com/vernesong/mihomo/Alpha/component/smart/lightgbm/transform.go"
 
 # --------------------------- 特征变换配置 ---------------------------
@@ -541,7 +541,7 @@ def run_training():
     except Exception as e:
         logger.error(f"初始化失败: {e}")
         logger.info(f"初始化失败: {e}")
-        return
+        raise RuntimeError("特征 Schema 初始化失败") from e
 
     logger.info("[特征 Schema 校验]")
     logger.info(f"📋 transform.go 定义的特征数量: {len(feature_order)}")
@@ -562,7 +562,7 @@ def run_training():
     except FileNotFoundError as e:
         logger.info(f"❌ 数据加载失败: {e}")
         logger.info("请确认数据目录中存在 CSV 文件，或使用 --data_dir 指定正确目录。")
-        return
+        raise
 
     # 节点分布健康检查：检测反馈循环/选择偏差，避免模型自我强化当前偏好
     data_healthy = check_data_balance(df)
@@ -573,10 +573,10 @@ def run_training():
         result = preprocess_data(df, feature_order)
     except Exception as e:
         logger.info(f"❌ 数据预处理失败: {e}")
-        return
+        raise
 
     if result is None:
-        return
+        raise ValueError("数据预处理未返回可训练样本")
     X, y = result
 
     X_train, X_test, y_train, y_test = train_test_split(

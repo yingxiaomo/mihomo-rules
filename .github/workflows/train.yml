@@ -1,9 +1,9 @@
 name: Train and Deploy Smart Model
 
 # ⚠️ 默认仅支持【手动触发】（GitHub Actions 页面点 Run workflow）。
-# 本仓库的数据来自魔改内核（PLD 5 特征），与官方脚本默认的 30 特征 schema
-# 不同；保留此工作流是给使用官方版内核的用户作参考。若你的内核是官方版
-# （或 train.py 的特征与你的内核匹配），想改回自动触发，取消下方注释：
+# 本仓库的主训练数据来自魔改内核（PLD 30 特征、Reward EMA 标签），与官方
+# 当前 32 特征 weight schema 不同；保留此工作流给官方 Smart 权重链路
+# 用户参考。若你的内核与 train.py schema 匹配，想改回自动触发，取消下方注释：
 #
 #   push:
 #     branches:

@@ -56,18 +56,22 @@ mihomo-rules/
 ├── rules/                      # 规则集（仅自用）
 ├── smart_trainer/              # 智能节点权重优化训练脚本
 │   ├── train.py               # 训练脚本，用于生成智能模型
+│   ├── train_pld.py           # PLD 先验模型训练脚本
+│   ├── test_train_pld.py      # PLD 因果特征/切分回归测试
 │   ├── requirements.txt       # Python 依赖
-│   ├── data/                  # 存放 CSV 数据文件（本地训练时使用）
+│   ├── data/                  # 存放 CSV / SQLite 数据（本地训练时使用）
 │   └── transform.go           # 可选的本地特征定义文件
 ├── Model.bin                   # 训练生成的智能模型
+├── PriorModel.bin              # PLD 训练生成的先验模型
 └── README.md
 ```
 
 ## 训练脚本版本兼容
 
-- **`smart_trainer/train.py`**：对齐官方 `vernesong/mihomo` Alpha（30 特征 schema），**所有用户使用本脚本**（`GO_REMOTE_URL` 指向官方 transform.go）。包含节点分布健康检查（`check_data_balance`），训练前检测反馈循环/数据偏斜。
+- **`smart_trainer/train.py`**：动态读取 `vernesong/mihomo` Alpha 当前的 `transform.go`（现为 32 特征、`weight` 标签），生成 `Model.bin`。
+- **`smart_trainer/train_pld.py`**：对齐 `yingxiaomo/mmihos` `dev-smart` 的 PLD 先验链路（固定 30 特征、通道 Reward EMA 标签），生成 `PriorModel.bin`。在线状态特征按全局时间因果重放；当 collector 抽样存在缺口时只按已观测后验近似，不把本行标签重复执行 EMA。验证集使用未来 20% 时间切片，并分别报告已见/未见组合。
 
-> 脚本从 `GO_REMOTE_URL` 下载对应 transform.go 训练。内核版本必须与脚本的特征 schema 匹配，否则模型不兼容会自动回退传统权重。
+> 只有官方链路的 `train.py` 会从 `GO_REMOTE_URL` 下载 `transform.go`；PLD 链路使用脚本内固定、并由单元测试对齐内核的 30 特征顺序。模型与内核 schema 不匹配时会回退传统权重。
 
 ## 训练工作流（GitHub Actions）
 
@@ -75,12 +79,12 @@ mihomo-rules/
 
 | 工作流 | 训练脚本 | 模型 tag | 触发方式 | 说明 |
 |---|---|---|---|---|
-| `Train and Deploy PLD Smart Model` | `train_pld.py` | `smart-pld-model` | **定时自动**（每周日 22:30 UTC）+ 脚本变更触发 + 手动兜底 | **PLD 先验模型**（30 特征，reward 标签），适配魔改内核 `usepld` 链路 |
-| `Train and Deploy Smart Model` | `train.py` | `smart-model` | **手动触发**（改自动的方法见文件注释） | 官方 30 特征权重模型，适配官方版内核 `uselightgbm` 链路 |
+| `Train and Deploy PLD Smart Model` | `train_pld.py` | `smart-pld-model` | **定时自动**（每周日 22:30 UTC）+ 脚本变更触发 + 手动兜底 | **PLD 先验模型**（30 特征，通道 Reward EMA 标签），适配魔改内核 `usepld` 链路 |
+| `Train and Deploy Smart Model` | `train.py` | `smart-model` | **手动触发**（改自动的方法见文件注释） | 官方当前 32 特征权重模型，适配官方版内核 `uselightgbm` 链路 |
 
 **PLD 工作流运行条件**：需在仓库 Secrets 配置 `RCLONE_CONFIG_B64`（rclone.conf 的 base64，含 gdrive 远程）、`REMOTE`（如 `gdrive:smart_data`）；`TG_BOT_TOKEN` / `TG_CHAT_ID` 用于训练结果通知（可选）。手动触发：Actions 页面点 `Run workflow`。
 
-> ⚠️ **重要**：训练脚本与内核的特征 schema 必须严格一致——魔改内核（`dev-smart` 分支，PLD 5 特征）请用 `train_pld.py` 并发布到 `smart-pld-model`；官方版内核请用 `train.py` 发布 `smart-model`。混用会导致模型特征错位、选路异常。
+> ⚠️ **重要**：训练脚本与内核的特征顺序和标签语义必须严格一致——魔改内核（`dev-smart` 分支，PLD 30 特征）请用 `train_pld.py` 并发布到 `smart-pld-model`；官方 Smart 权重链路请用 `train.py` 发布 `smart-model`。当前两者分别是 30 / 32 个槽位，含义也不同，混用会导致模型拒载或选路异常。
 
 ## 相关文档
 
