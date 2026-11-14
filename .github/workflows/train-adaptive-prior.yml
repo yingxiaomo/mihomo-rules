@@ -1,6 +1,6 @@
 name: Train and Deploy Adaptive Dimensional Priors
 
-# 与 train-pld.yml 并存：读取同一份只读样本，但生成独立的 Adaptive 三维先验包。
+# 与 train-pld.yml 并存，但只消费 Adaptive 内核原生事件；PLD 链路保持独立。
 # 每周日 23:00 UTC（周一 07:00 北京时间）自动训练。
 on:
   push:
@@ -9,7 +9,6 @@ on:
     paths:
       - 'smart_trainer/train_adaptive_prior.py'
       - 'smart_trainer/test_train_adaptive_prior.py'
-      - 'smart_trainer/train_pld.py'
       - 'smart_trainer/requirements-adaptive.txt'
       - '.github/workflows/train-adaptive-prior.yml'
   schedule:
@@ -26,6 +25,7 @@ jobs:
       RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
       REMOTE: ${{ secrets.REMOTE }}
       RELEASE_TAG: adaptive-prior-model-${{ github.run_number }}
+      ADAPTIVE_REPO_URL: https://github.com/yingxiaomo/mihomo
 
     steps:
       - name: Checkout repository
@@ -53,25 +53,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Pull immutable training snapshot
+      - name: Pull immutable native-event snapshot
         run: |
-          rclone copy "${REMOTE}/pld" "${GITHUB_WORKSPACE}/" \
+          mkdir -p adaptive-data
+          rclone copy "${REMOTE}/adaptive-native" "${GITHUB_WORKSPACE}/adaptive-data" \
             --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO \
-            --include "smart_samples*"
-          if [ -z "$(compgen -G 'smart_samples*.db'; compgen -G 'smart_samples*.csv')" ]; then
-            echo "::error::No smart_samples SQLite/CSV data found."
+            --include "*.jsonl.ready" --include "*.jsonl.failed" --include "*.jsonl.recovered"
+          if [ -z "$(find adaptive-data -type f -name '*.jsonl.ready' -print -quit)" ]; then
+            echo "::error::No closed Adaptive native-event files found."
             exit 1
           fi
 
-      - name: Train three dimensional priors
+      - name: Train four native dimensional priors
         run: |
           set -o pipefail
           python smart_trainer/train_adaptive_prior.py \
-            --data-dir . \
+            --data-dir adaptive-data \
             --output AdaptivePrior.json
 
       - name: Checkout Go consumer
-        run: git clone --depth 1 --branch adaptive-v1 https://github.com/yingxiaomo/mihomo.git /tmp/mmihos-adaptive
+        run: git clone --depth 1 --branch adaptive-v1 "$ADAPTIVE_REPO_URL" /tmp/mmihos-adaptive
 
       - name: Set up Go for cross-language verification
         uses: actions/setup-go@v6
@@ -106,7 +107,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_NOTES="Adaptive 分维度先验自动训练完成。<br><br>Commit: ${{ github.sha }}<br>Run ID: ${{ github.run_id }}<br><br>独立预测 connect milliseconds / throughput bps / failure probability；与 PLD PriorModel.bin 互不覆盖。"
+          RELEASE_NOTES="Adaptive 原生四维先验自动训练完成。<br><br>Commit: ${{ github.sha }}<br>Run ID: ${{ github.run_id }}<br><br>独立预测 connect / response / throughput / failure；只消费 native event schema，与 PLD PriorModel.bin 互不覆盖。"
           gh release create "$RELEASE_TAG" \
             --title "Adaptive Dimensional Priors" \
             --notes "$RELEASE_NOTES" \
@@ -118,4 +119,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f rclone.conf smart_samples*.db smart_samples*.csv AdaptivePrior*.lgb AdaptivePrior.json AdaptivePrior-v1.zip*
+        run: rm -rf rclone.conf adaptive-data AdaptivePrior*.lgb AdaptivePrior.json AdaptivePrior-v1.zip*
