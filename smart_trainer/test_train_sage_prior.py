@@ -1,8 +1,10 @@
-import json, math, tempfile, unittest
+import json, math, os, tempfile, unittest
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
-from smart_trainer.train_sage_prior import DIMENSIONS, FEATURE_ORDER, FEATURE_SCHEMA, MAX_PRIOR_CONFIDENCE, SOURCE_SCHEMA, _weighted_median, build_features, build_training_tables, load_native_events, save_bundle, train_dimension
+import requests
+from smart_trainer.train_sage_prior import DIMENSIONS, FEATURE_ORDER, FEATURE_SCHEMA, LOGGER, MAX_PRIOR_CONFIDENCE, SOURCE_SCHEMA, _close_logging, _weighted_median, build_features, build_training_tables, load_native_events, run_training, save_bundle, send_telegram_logs, setup_logging, train_dimension
 
 def feature(i): return [0.,1.,math.log1p(443),float(i%97),float(i%89),float(i%83),52.,3.]
 def events(count=180):
@@ -63,6 +65,38 @@ class TrainingTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as tmp:
    output=Path(tmp)/"SagePrior.json"; manifest=save_bundle(output,attempts,models,meta); self.assertEqual(json.loads(output.read_text()),manifest); self.assertEqual(manifest["source_schema"],SOURCE_SCHEMA); self.assertEqual(manifest["feature_schema"],FEATURE_SCHEMA); self.assertEqual(set(manifest["dimensions"]),set(DIMENSIONS))
    for name,d in manifest["dimensions"].items():self.assertTrue((output.parent/d["model"]).is_file());self.assertEqual(d["output_transform"],"sigmoid" if name=="failure" else "identity")
+ def test_detailed_training_log(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp);data=root/"data";data.mkdir();write_ready(data,events());output=root/"SagePrior.json";log_path=root/"training_sage.log"
+   run_training(["--data-dir",str(data),"--output",str(output),"--log-file",str(log_path)])
+   content=log_path.read_text(encoding="utf-8")
+   for marker in ("[步骤1]","[步骤2]","decision_unix_nano","observed_unix_nano","candidate=","invalid/range dropped=","late dropped=","训练 connect 维度","训练 response 维度","训练 throughput 维度","训练 failure 维度","最佳迭代","最终验证","model_error=","baseline_error=","strategy=train weighted median","strategy=train weighted failure prevalence","confidence=","gate=","[步骤4]","训练完成"):self.assertIn(marker,content)
+   self.assertRegex(content,r"manifest: .*sha256=[0-9a-f]{64}")
+   for name in DIMENSIONS:self.assertRegex(content,rf"{name}.*sha256=[0-9a-f]{{64}}")
+ def test_telegram_failure_is_truthful_and_secret_safe(self):
+  token="test-secret-token"
+  with tempfile.TemporaryDirectory() as tmp:
+   log_path=Path(tmp)/"training_sage.log";setup_logging(log_path)
+   try:
+    with patch.dict(os.environ,{"TG_BOT_TOKEN":token,"TG_CHAT_ID":"1"}),patch("smart_trainer.train_sage_prior.requests.post",side_effect=requests.ConnectionError(f"https://api.telegram.org/bot{token}/sendMessage")),patch("smart_trainer.train_sage_prior.time.sleep"):
+     send_telegram_logs("header",log_path)
+   finally:_close_logging()
+   content=log_path.read_text(encoding="utf-8");self.assertNotIn(token,content);self.assertIn("Telegram 日志推送不完整",content);self.assertNotIn("Telegram 日志推送完成",content)
+ def test_telegram_http_200_requires_api_ok(self):
+  class RejectedResponse:
+   status_code=200
+   def json(self):return {"ok":False,"error_code":400}
+  with tempfile.TemporaryDirectory() as tmp:
+   log_path=Path(tmp)/"training_sage.log";setup_logging(log_path)
+   try:
+    with patch.dict(os.environ,{"TG_BOT_TOKEN":"token","TG_CHAT_ID":"1"}),patch("smart_trainer.train_sage_prior.requests.post",return_value=RejectedResponse()),patch("smart_trainer.train_sage_prior.time.sleep"):
+     send_telegram_logs("header",log_path)
+   finally:_close_logging()
+   content=log_path.read_text(encoding="utf-8");self.assertIn("Bot API ok!=true",content);self.assertIn("Telegram 日志推送不完整",content);self.assertNotIn("Telegram 日志推送完成",content)
+ def test_log_setup_failure_leaves_no_handler(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   with self.assertRaises(OSError):setup_logging(Path(tmp))
+   self.assertEqual(LOGGER.handlers,[])
  def test_deterministic_and_atomic(self):
   bundles=[]; trained=[]
   with tempfile.TemporaryDirectory() as tmp:
