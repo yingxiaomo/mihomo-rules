@@ -1,0 +1,28 @@
+# Sage 切换时的组配置选项片段，不是完整 Mihomo 配置。
+# 合并到现有 Smart 锚点，保留原 Check/provider/rules；不得直接替换生产文件。
+# 仅改 type 与默认数据命名空间；已经启用的能力保持启用。
+type: sage
+include-all: true
+hidden: true
+exclude-type: direct
+exploration: true
+collect-events: true
+scene-rules: ["DOMAIN-SUFFIX,googlevideo.com,media"]
+media-reconnect: true
+media-reconnect-domains: ["googlevideo.com"]
+media-low-throughput: 3000000
+media-low-windows: 3
+media-max-low-windows: 4
+media-min-age: 15
+media-min-bytes: 2097152
+media-demand-bps: 2000000
+media-buffer-guard: 3
+media-reconnect-cooldown: 600
+media-slow-cooldown: 1800
+media-hint-ttl: 15
+media-challenger-ratio: 1.25
+media-reconnect-budget: 3
+media-budget-window: 1800
+# 首次切换不配置 prior-model，待 Sage 原生训练发布后另行授权启用。
+# prior-model: sage-prior/SagePrior.json
+# gray-failure-observation 保持缺省关闭；本片段不启用任何第二期功能。

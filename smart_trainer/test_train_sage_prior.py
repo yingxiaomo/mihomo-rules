@@ -2,7 +2,7 @@ import json, math, tempfile, unittest
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from smart_trainer.train_adaptive_prior import DIMENSIONS, FEATURE_ORDER, FEATURE_SCHEMA, MAX_PRIOR_CONFIDENCE, SOURCE_SCHEMA, _weighted_median, build_features, build_training_tables, load_native_events, save_bundle, train_dimension
+from smart_trainer.train_sage_prior import DIMENSIONS, FEATURE_ORDER, FEATURE_SCHEMA, MAX_PRIOR_CONFIDENCE, SOURCE_SCHEMA, _weighted_median, build_features, build_training_tables, load_native_events, save_bundle, train_dimension
 
 def feature(i): return [0.,1.,math.log1p(443),float(i%97),float(i%89),float(i%83),52.,3.]
 def events(count=180):
@@ -17,7 +17,7 @@ def events(count=180):
  return pd.DataFrame(out)
 def write_ready(root, frame, dropped=0, incomplete=0):
  sequence=frame["event_seq"].astype(int)
- path=Path(root)/"adaptive-native-v1.run.1.1.jsonl.ready"; header={"source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"run_id":"run","event_type":"file_header","observed_unix_nano":1}; footer={"source_schema":SOURCE_SCHEMA,"run_id":"run","event_type":"file_footer","observed_unix_nano":2,"dropped_control":0,"dropped_segment":dropped,"incomplete_attempts":incomplete,"written_events":len(frame),"first_event_seq":int(sequence.min()) if len(sequence) else 0,"last_event_seq":int(sequence.max()) if len(sequence) else 0}
+ path=Path(root)/"sage-native-v1.run.1.1.jsonl.ready"; header={"source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"run_id":"run","event_type":"file_header","observed_unix_nano":1}; footer={"source_schema":SOURCE_SCHEMA,"run_id":"run","event_type":"file_footer","observed_unix_nano":2,"dropped_control":0,"dropped_segment":dropped,"incomplete_attempts":incomplete,"written_events":len(frame),"first_event_seq":int(sequence.min()) if len(sequence) else 0,"last_event_seq":int(sequence.max()) if len(sequence) else 0}
  with path.open("w",encoding="utf-8",newline="\n") as f:
   f.write(json.dumps(header,separators=(",",":"))+"\n")
   for row in frame.to_dict("records"):f.write(json.dumps(row,separators=(",",":"))+"\n")
@@ -61,17 +61,17 @@ class TrainingTests(unittest.TestCase):
  def test_four_models_native_manifest(self):
   attempts,models,meta=self.train()
   with tempfile.TemporaryDirectory() as tmp:
-   output=Path(tmp)/"AdaptivePrior.json"; manifest=save_bundle(output,attempts,models,meta); self.assertEqual(json.loads(output.read_text()),manifest); self.assertEqual(manifest["source_schema"],SOURCE_SCHEMA); self.assertEqual(manifest["feature_schema"],FEATURE_SCHEMA); self.assertEqual(set(manifest["dimensions"]),set(DIMENSIONS))
+   output=Path(tmp)/"SagePrior.json"; manifest=save_bundle(output,attempts,models,meta); self.assertEqual(json.loads(output.read_text()),manifest); self.assertEqual(manifest["source_schema"],SOURCE_SCHEMA); self.assertEqual(manifest["feature_schema"],FEATURE_SCHEMA); self.assertEqual(set(manifest["dimensions"]),set(DIMENSIONS))
    for name,d in manifest["dimensions"].items():self.assertTrue((output.parent/d["model"]).is_file());self.assertEqual(d["output_transform"],"sigmoid" if name=="failure" else "identity")
  def test_deterministic_and_atomic(self):
   bundles=[]; trained=[]
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)
    for generation in ("one","two"):
-    attempts,models,meta=self.train(); output=root/generation/"AdaptivePrior.json"; manifest=save_bundle(output,attempts,models,meta); payload={output.name:output.read_bytes()}
+    attempts,models,meta=self.train(); output=root/generation/"SagePrior.json"; manifest=save_bundle(output,attempts,models,meta); payload={output.name:output.read_bytes()}
     for d in manifest["dimensions"].values():payload[d["model"]]=(output.parent/d["model"]).read_bytes()
     bundles.append(payload);trained.append((attempts,models,meta))
-   self.assertEqual(bundles[0],bundles[1]); output=root/"atomic"/"AdaptivePrior.json";output.parent.mkdir();output.write_text("old\n")
+   self.assertEqual(bundles[0],bundles[1]); output=root/"atomic"/"SagePrior.json";output.parent.mkdir();output.write_text("old\n")
    class Broken:
     best_iteration=1
     def save_model(self,*_a,**_k):raise RuntimeError("injected")

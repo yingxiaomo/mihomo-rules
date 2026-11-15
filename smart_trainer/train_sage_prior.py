@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train four priors from Adaptive native events; PLD is never accepted."""
+"""Train four priors from Sage native events; PLD is never accepted."""
 from __future__ import annotations
 import argparse, hashlib, json, os, shutil, tempfile
 from pathlib import Path
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-SCHEMA_VERSION=2; SOURCE_SCHEMA="adaptive-native-events-v1"; FEATURE_SCHEMA="adaptive-prior-native-features-v1"
+SCHEMA_VERSION=2; SOURCE_SCHEMA="sage-native-events-v1"; FEATURE_SCHEMA="sage-prior-native-features-v1"
 MAX_PRIOR_CONFIDENCE=.35; MIN_TRAIN_ROWS=20; MIN_VALID_ROWS=5; MIN_CONFIDENCE_ROWS=20
 FEATURE_ORDER=["is_udp","is_tcp","port_log","asn_hash","host_hash","ip_hash","group_hash","node_type"]
 DIMENSIONS=("connect","response","throughput","failure"); PARTITIONS=("train","early_stop","calibration","final_test")
@@ -21,10 +21,10 @@ def load_native_events(data_dir):
  compromised=set()
  for marker in [*root.rglob("*.jsonl.failed"),*root.rglob("*.jsonl.recovered")]:
   parts=marker.name.split(".")
-  if len(parts)<3 or parts[0]!="adaptive-native-v1": raise ValueError(f"无法识别损坏采集文件 {marker}")
+  if len(parts)<3 or parts[0]!="sage-native-v1": raise ValueError(f"无法识别损坏采集文件 {marker}")
   compromised.add(parts[1])
  files=sorted(p for p in root.rglob("*.jsonl.ready") if p.is_file() and (len(p.name.split("."))<2 or p.name.split(".")[1] not in compromised))
- if not files: raise ValueError("未找到 Adaptive 原生 .jsonl.ready 数据")
+ if not files: raise ValueError("未找到 Sage 原生 .jsonl.ready 数据")
  by_id={}
  for path in files:
   header=footer=False; run_id=""; local=[]; footer_event=None
@@ -159,7 +159,7 @@ def save_bundle(output,attempts,models,metadata):
  finally:shutil.rmtree(staging,ignore_errors=True)
 
 def run_training(argv=None):
- p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"adaptive-data");p.add_argument("--output",type=Path,default=Path(__file__).parent/"AdaptivePrior.json");a=p.parse_args(argv);events=load_native_events(a.data_dir);attempts,tables=build_training_tables(events);models={};metadata={}
+ p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"sage-data");p.add_argument("--output",type=Path,default=Path(__file__).parent/"SagePrior.json");a=p.parse_args(argv);events=load_native_events(a.data_dir);attempts,tables=build_training_tables(events);models={};metadata={}
  for name in DIMENSIONS:models[name],metadata[name]=train_dimension(name,tables[name])
  return save_bundle(a.output,attempts,models,metadata)
 if __name__=="__main__":run_training()

@@ -1,0 +1,122 @@
+name: Train and Deploy Sage Dimensional Priors
+
+# 与 train-pld.yml 并存，但只消费 Sage 内核原生事件；PLD 链路保持独立。
+# 每周日 23:00 UTC（周一 07:00 北京时间）自动训练。
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'smart_trainer/train_sage_prior.py'
+      - 'smart_trainer/test_train_sage_prior.py'
+      - 'smart_trainer/requirements-sage.txt'
+      - '.github/workflows/train-sage-prior.yml'
+  schedule:
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  train_and_deploy:
+    runs-on: ubuntu-latest
+    env:
+      RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+      REMOTE: ${{ secrets.REMOTE }}
+      RELEASE_TAG: sage-prior-model-${{ github.run_number }}
+      SAGE_REPO_URL: https://github.com/yingxiaomo/mihomo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r smart_trainer/requirements-sage.txt
+
+      - name: Run Sage prior unit tests
+        run: python -m unittest smart_trainer.test_train_sage_prior -v
+
+      - name: Set up rclone
+        run: |
+          echo "$RCLONE_CONFIG_B64" | base64 -d > rclone.conf
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Pull immutable native-event snapshot
+        run: |
+          mkdir -p sage-data
+          rclone copy "${REMOTE}/sage-native" "${GITHUB_WORKSPACE}/sage-data" \
+            --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO \
+            --include "*.jsonl.ready" --include "*.jsonl.failed" --include "*.jsonl.recovered"
+          if [ -z "$(find sage-data -type f -name '*.jsonl.ready' -print -quit)" ]; then
+            echo "::error::No closed Sage native-event files found."
+            exit 1
+          fi
+
+      - name: Train four native dimensional priors
+        run: |
+          set -o pipefail
+          python smart_trainer/train_sage_prior.py \
+            --data-dir sage-data \
+            --output SagePrior.json
+
+      - name: Checkout Go consumer
+        run: git clone --depth 1 --branch dev-sage "$SAGE_REPO_URL" /tmp/mmihos-sage
+
+      - name: Set up Go for cross-language verification
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.5'
+          cache-dependency-path: /tmp/mmihos-sage/go.sum
+
+      - name: Verify bundle with the real Go consumer
+        run: |
+          mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json)
+          mkdir -p /tmp/mmihos-sage/prior-integration
+          cp SagePrior.json "${MODELS[@]}" /tmp/mmihos-sage/prior-integration/
+          cd /tmp/mmihos-sage
+          SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
+
+      - name: Build self-contained prior bundle
+        run: |
+          mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json | sort)
+          TZ=UTC touch -t 198001010000 SagePrior.json "${MODELS[@]}"
+          zip -X -j SagePrior-v1.zip SagePrior.json "${MODELS[@]}"
+          sha256sum SagePrior-v1.zip > SagePrior-v1.zip.sha256
+
+      - name: Upload prior bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: sage-prior-bundle
+          path: |
+            SagePrior-v1.zip
+            SagePrior-v1.zip.sha256
+
+      - name: Publish Sage prior bundle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_NOTES="Sage 原生四维先验自动训练完成。<br><br>Commit: ${{ github.sha }}<br>Run ID: ${{ github.run_id }}<br><br>独立预测 connect / response / throughput / failure；只消费 native event schema，与 PLD PriorModel.bin 互不覆盖。"
+          gh release create "$RELEASE_TAG" \
+            --title "Sage Dimensional Priors" \
+            --notes "$RELEASE_NOTES" \
+            --target main \
+            --draft
+          gh release upload "$RELEASE_TAG" SagePrior-v1.zip SagePrior-v1.zip.sha256
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" -eq 2
+          gh release edit "$RELEASE_TAG" --draft=false --latest=false
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf rclone.conf sage-data SagePrior*.lgb SagePrior.json SagePrior-v1.zip*

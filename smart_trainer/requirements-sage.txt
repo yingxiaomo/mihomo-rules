@@ -1,4 +1,4 @@
-# Reproducible Adaptive prior training environment.
+# Reproducible Sage prior training environment.
 # Kept separate so the existing PLD trainer may retain its wider ranges.
 lightgbm==4.7.0
 pandas==3.1.1
