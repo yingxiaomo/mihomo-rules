@@ -86,7 +86,7 @@ jobs:
           mkdir -p /tmp/mmihos-sage/prior-integration
           cp SagePrior.json "${MODELS[@]}" /tmp/mmihos-sage/prior-integration/
           cd /tmp/mmihos-sage
-          SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
+          SAGE_PRIOR_BUNDLE=/tmp/mmihos-sage/prior-integration/SagePrior.json go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
 
       - name: Build self-contained prior bundle
         run: |

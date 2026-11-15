@@ -198,7 +198,7 @@ class SageRepositoryNamingTests(unittest.TestCase):
             '--branch dev-sage "$SAGE_REPO_URL" /tmp/mmihos-sage',
             "go-version: '1.26.5'", "/tmp/mmihos-sage/go.sum",
             'gh release edit "$RELEASE_TAG" --draft=false --latest=false',
-            "SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json",
+            "SAGE_PRIOR_BUNDLE=/tmp/mmihos-sage/prior-integration/SagePrior.json",
             "TestSagePriorExternalBundle", "SagePrior-v1.zip",
             "SagePrior-v1.zip.sha256", "name: sage-prior-bundle",
         ):
@@ -207,7 +207,7 @@ class SageRepositoryNamingTests(unittest.TestCase):
         self.assertNotRegex(workflow, "adaptive|Adaptive|ADAPTIVE")
 
     def test_renamed_files_preserve_baseline_except_explicit_release_wiring(self):
-        # Baseline 67bd61d; only three explicit deployment-wiring differences.
+        # Baseline 67bd61d; only four explicit deployment-wiring differences.
         # Algorithms, dependencies and every other workflow byte stay frozen.
         expected = {
             "smart_trainer/train_sage_prior.py": "da9fa336cf2cc758b4723bd5fd1781774d9fe751a80846805072268db89957e6",
@@ -226,6 +226,8 @@ class SageRepositoryNamingTests(unittest.TestCase):
                         ("--branch dev-sage ", "--branch sage-v1 "),
                         ("go-version: '1.26.5'", "go-version-file: /tmp/mmihos-sage/go.mod"),
                         ("--draft=false --latest=false", "--draft=false --latest"),
+                        ("SAGE_PRIOR_BUNDLE=/tmp/mmihos-sage/prior-integration/SagePrior.json",
+                         "SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json"),
                     ):
                         self.assertEqual(text.count(released), 1)
                         text = text.replace(released, baseline)
