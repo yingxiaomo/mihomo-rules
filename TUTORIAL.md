@@ -18,16 +18,14 @@
 
 2. **准备训练数据**：
    - 官方 Smart 权重模型：将 `smart_weight_data*.csv` 放入 `smart_trainer/data/`，运行 `train.py`。
-   - PLD 先验模型：将 `smart_samples*.db` / `smart_samples*.csv` 放入该目录，运行 `train_pld.py`。
 
 3. **官方链路可选：准备 transform.go**：
-   仅 `train.py` 使用它。可将 [Mihomo 源码](https://github.com/vernesong/mihomo/blob/Alpha/component/smart/lightgbm/transform.go#L13)中的 `transform.go` 复制到 `smart_trainer/`，脚本会优先使用本地文件。`train_pld.py` 使用内置的固定 PLD 特征顺序，不读取该文件。
+   仅 `train.py` 使用它。可将 [Mihomo 源码](https://github.com/vernesong/mihomo/blob/Alpha/component/smart/lightgbm/transform.go#L13)中的 `transform.go` 复制到 `smart_trainer/`，脚本会优先使用本地文件。
 
 ### 运行训练
 
 ```bash
 python smart_trainer/train.py
-# PLD 内核则运行：python smart_trainer/train_pld.py
 ```
 
 `train.py`（官方链路）会：
@@ -36,15 +34,10 @@ python smart_trainer/train.py
 - 在训练集拟合并应用 StandardScaler / RobustScaler；
 - 训练并保存 `Model.bin`（含特征顺序和 Scaler 参数）。
 
-`train_pld.py`（PLD 链路）会：
-- 加载 SQLite / CSV 并按全局事件时间稳定排序；
-- 按固定 30 特征构造因果前态，以过去 80% 训练、未来 20% 验证；
-- 只对 `node_sample_count` 拟合并应用 RobustScaler；
-- 训练并保存 `PriorModel.bin`（含变换元数据），再按已见/未见组合报告验证结果。
 
 ### 训练配置
 
-官方链路可在 `smart_trainer/train.py` 顶部修改以下配置；PLD 参数位于 `train_pld.py`，两者不要混用：
+官方链路可在 `smart_trainer/train.py` 顶部修改以下配置：
 
 ```python
 # 模型训练配置
@@ -73,13 +66,11 @@ ROBUST_SCALER_FEATURES = [...]  # RobustScaler 特征列表
 
 ```bash
 python smart_trainer/train.py --data_dir smart_trainer/data
-python smart_trainer/train_pld.py --data_dir smart_trainer/data
 ```
 
 | 参数 | 说明 |
 | :--- | :--- |
 | `train.py --data_dir` | 官方链路 CSV 数据目录（默认：`smart_trainer/data/`） |
-| `train_pld.py --data_dir` | PLD 链路 SQLite / CSV 数据目录（默认：`smart_trainer/data/`） |
 
 ---
 
@@ -235,8 +226,8 @@ cat /root/.config/rclone/rclone.conf | base64 -w 0
 
 自动化流程：
 1. **拉取数据** — 使用 rclone 从云端下载对应训练数据
-2. **训练模型** — 官方工作流运行 `train.py`；PLD 工作流运行 `train_pld.py`
-3. **发布 Release** — 分别更新 `smart-model` / `smart-pld-model` 标签
+2. **训练模型** — 官方工作流运行 `train.py`
+3. **发布 Release** — 更新 `smart-model` 标签
 4. **发送通知** — 通过 Telegram 发送训练结果和日志
 
-> `.github/workflows/train.yml`（官方模型）默认仅手动触发；`.github/workflows/train-pld.yml` 默认每周日 22:30 UTC 定时运行，也支持手动触发，并在 `train_pld.py` 变更时触发。
+> `.github/workflows/train.yml`（官方模型）默认仅手动触发。
