@@ -1,4 +1,4 @@
-import hashlib, json, math, os, tempfile, unittest
+import hashlib, json, math, os, sys, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np
@@ -153,6 +153,7 @@ class TrainingTests(unittest.TestCase):
    self.assertEqual(output.read_text(),"old\n")
  def test_fixed_fixture_model_bytes_and_algorithm_signature(self):
   fixture=Path(__file__).resolve().parents[1]/"tests"/"fixtures"/"sage_prior";expected=json.loads((fixture/"expected_hashes.json").read_text(encoding="utf-8"));frame=load_native_events(fixture);attempts,tables=build_training_tables(frame);preflight=preflight_training_tables(tables);models={};metadata={}
+  platform_expected=expected["platforms"].get(sys.platform);self.assertIsNotNone(platform_expected,f"no frozen fixture hashes for {sys.platform}");expected={"algorithm_signature":expected["algorithm_signature"],**platform_expected}
   self.assertLess(frame.loc[frame.event_type.eq("decision"),"decision_unix_nano"].nunique(),len(attempts));self.assertGreater(sum(table.attrs["late_dropped_rows"] for table in tables.values()),0)
   for name in DIMENSIONS:models[name],metadata[name]=train_dimension(name,tables[name],preflight[name])
   with tempfile.TemporaryDirectory() as tmp:
