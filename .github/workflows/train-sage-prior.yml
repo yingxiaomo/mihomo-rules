@@ -116,8 +116,9 @@ jobs:
           mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json)
           mkdir -p go-consumer/prior-integration
           cp SagePrior.json "${MODELS[@]}" go-consumer/prior-integration/
+          BUNDLE_PATH="$(pwd)/go-consumer/prior-integration/SagePrior.json"
           cd go-consumer
-          SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
+          SAGE_PRIOR_BUNDLE="$BUNDLE_PATH" go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
 
       - name: Build self-contained prior bundle
         id: build_bundle
