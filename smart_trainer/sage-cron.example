@@ -1,6 +1,0 @@
-# Sage P1 v2 命名空间对照模板；不是安装命令，不要自动覆盖整个 crontab。
-# upsage.sh 仅上传 sage-events-v2/sage-native-v2；更新器仅安装 sage-prior-v2。
-# 北京时间周一 06:00 上传；周一 10:00 更新模型。
-# 更新器仍保留现有换装/重启行为；生产启用必须另行审核并获授权。
-0 6 * * 1 /root/smart/upsage.sh >> /root/smart/log/upload_cron.log 2>&1
-0 10 * * 1 /root/smart/update_sage_prior.sh >> /root/smart/log/update_cron.log 2>&1
