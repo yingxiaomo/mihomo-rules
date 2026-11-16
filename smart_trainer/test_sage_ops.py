@@ -35,8 +35,8 @@ class RuntimeNamingTests(unittest.TestCase):
         source = source.replace("/etc/nikki/run", (self.root / "home").as_posix())
         source = source.replace("/root/smart", (self.root / "smart").as_posix())
         source = source.replace("/root/.config/rclone/rclone.conf", (self.root / "rclone.conf").as_posix())
-        source = source.replace("/tmp/sage-prior.new", (self.root / "download").as_posix())
-        source = source.replace("gdrive:smart_data/sage-native", (self.root / "remote").as_posix())
+        source = source.replace("/tmp/sage-prior-v2.new", (self.root / "download").as_posix())
+        source = source.replace("gdrive:smart_data/sage-native-v2", (self.root / "remote").as_posix())
         source = source.replace("/etc/init.d/nikki", "nikki")
         # No unexpected network endpoint can be contacted: curl always fails
         # unless a particular test supplies a fake response.
@@ -51,8 +51,8 @@ class RuntimeNamingTests(unittest.TestCase):
 
     def test_syntax_and_name_contract(self):
         expected = {
-            "upsage.sh": ["/etc/nikki/run/sage-events", "/root/smart/sage-archive", "gdrive:smart_data/sage-native"],
-            "update_sage_prior.sh": ["sage-prior-model-", "/etc/nikki/run/sage-prior", "SagePrior-v1.zip", "SagePrior.json"],
+            "upsage.sh": ["/etc/nikki/run/sage-events-v2", "/root/smart/sage-archive-v2", "gdrive:smart_data/sage-native-v2", "sage-native-v2.*.jsonl.ready"],
+            "update_sage_prior.sh": ["sage-prior-v2-model-", "/etc/nikki/run/sage-prior-v2", "SagePrior-v2.zip", "SagePrior.json"],
         }
         for name, tokens in expected.items():
             source = (HERE / name).read_text(encoding="utf-8")
@@ -64,15 +64,29 @@ class RuntimeNamingTests(unittest.TestCase):
             result = subprocess.run([self.shell, "-n", str(HERE / name)], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_runtime_docs_use_isolated_v2_namespace_and_pld_stays_separate(self):
+        runtime = (HERE / "SAGE_RUNTIME.md").read_text(encoding="utf-8")
+        profile = (HERE / "sage-profile.example.yaml").read_text(encoding="utf-8")
+        cron = (HERE / "sage-cron.example").read_text(encoding="utf-8")
+        for token in ("sage-native-events-v2", "sage-prior-native-features-v2",
+                      "sage-native-v2.key", "sage-events-v2", "sage-native-v2",
+                      "sage-prior-v2", "SagePrior-v2.zip", "sage-prior-v2-model-"):
+            self.assertIn(token, runtime)
+        self.assertIn("sage-prior-v2/SagePrior.json", profile)
+        self.assertIn("sage-events-v2/sage-native-v2", cron)
+        root = HERE.parent
+        for pld_path in (root / ".github/workflows/train-pld.yml", HERE / "train_pld.py"):
+            self.assertNotIn("sage-native-v2", pld_path.read_text(encoding="utf-8"))
+
     def test_upload_closed_files_preserves_live_and_legacy(self):
         script = self.script("upsage.sh")
         self.stub("rclone", 'case "$1" in\ncopy) mkdir -p "$3"; cp "$2"/* "$3"/ ;;\nlsl) wc -c < "$2" ;;\n*) exit 90 ;;\nesac\n')
-        group = self.root / "home/sage-events/g-one"
+        group = self.root / "home/sage-events-v2/g-one"
         group.mkdir(parents=True)
         payload = b"closed-script-path-fixture\n"
-        ready = group / "sage-native-v1.run.1.1.jsonl.ready"
+        ready = group / "sage-native-v2.run.1.1.jsonl.ready"
         ready.write_bytes(payload)
-        live = group / "sage-native-v1.run.1.2.jsonl.open"
+        live = group / "sage-native-v2.run.1.2.jsonl.open"
         live.write_bytes(b"live")
         legacy = self.root / "home/adaptive-events/g-old"
         legacy.mkdir(parents=True)
@@ -82,20 +96,20 @@ class RuntimeNamingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "remote" / ready.name).read_bytes(), payload)
         self.assertFalse(ready.exists())
-        self.assertFalse((self.root / "smart/sage-archive" / ready.name).exists())
+        self.assertFalse((self.root / "smart/sage-archive-v2" / ready.name).exists())
         self.assertEqual(live.read_bytes(), b"live")
         self.assertEqual(old.read_bytes(), b"legacy")
 
     def test_upload_failure_retains_closed_archive(self):
         script = self.script("upsage.sh")
         self.stub("rclone", "exit 8\n")
-        group = self.root / "home/sage-events/g-one"
+        group = self.root / "home/sage-events-v2/g-one"
         group.mkdir(parents=True)
-        name = "sage-native-v1.run.1.1.jsonl.ready"
+        name = "sage-native-v2.run.1.1.jsonl.ready"
         (group / name).write_bytes(b"must survive")
         result = self.run_script(script)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.root / "smart/sage-archive" / name).read_bytes(), b"must survive")
+        self.assertEqual((self.root / "smart/sage-archive-v2" / name).read_bytes(), b"must survive")
 
     def test_updater_no_release_is_noop(self):
         script = self.script("update_sage_prior.sh")
@@ -107,9 +121,9 @@ class RuntimeNamingTests(unittest.TestCase):
 
     def test_updater_same_release_is_noop(self):
         script = self.script("update_sage_prior.sh")
-        tag = "sage-prior-model-123"
+        tag = "sage-prior-v2-model-123"
         self.stub("curl", "printf '%s' '" + json.dumps([{"tag_name": tag}]) + "'\n")
-        dest = self.root / "home/sage-prior"
+        dest = self.root / "home/sage-prior-v2"
         dest.mkdir(parents=True)
         (dest / ".release_tag").write_text(tag + "\n")
         model = dest / "SagePrior.json"

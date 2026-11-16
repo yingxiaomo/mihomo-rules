@@ -1,18 +1,22 @@
-name: Train and Deploy Sage Dimensional Priors
+name: Train and Publish Sage P1 Priors
 
-# 与 train-pld.yml 并存，但只消费 Sage 内核原生事件；PLD 链路保持独立。
-# 每周日 23:00 UTC（周一 07:00 北京时间）自动训练。
+# Push 只运行单测和 synthetic producer/trainer/consumer gate，不读取真实数据、
+# 不发布 Release。仅 schedule/workflow_dispatch 读取 v2 remote 并发布；PLD 独立。
 on:
   push:
     branches: [main]
     paths:
       - 'smart_trainer/train_sage_prior.py'
+      - 'smart_trainer/sage_synthetic_gate.py'
       - 'smart_trainer/sage_workflow_notify.py'
       - 'smart_trainer/test_sage_*.py'
       - 'smart_trainer/test_train_sage_prior.py'
       - 'smart_trainer/requirements-sage.txt'
       - 'smart_trainer/upsage.sh'
       - 'smart_trainer/update_sage_prior.sh'
+      - 'smart_trainer/SAGE_RUNTIME.md'
+      - 'smart_trainer/sage-profile.example.yaml'
+      - 'smart_trainer/sage-cron.example'
       - 'tests/fixtures/sage_prior/**'
       - '.github/workflows/train-sage-prior.yml'
   schedule:
@@ -20,18 +24,86 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  SAGE_CONSUMER_SHA: cbe478cdd5fd78587755c35a5603a8bd32cf4f7a
 
 jobs:
-  train_and_deploy:
+  push_gate:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install trainer dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r smart_trainer/requirements-sage.txt
+      - name: Run full Python test matrix
+        run: python -m unittest discover -s smart_trainer -p 'test_*.py' -v
+      - name: Checkout exact Go consumer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: yingxiaomo/mihomo
+          ref: ${{ env.SAGE_CONSUMER_SHA }}
+          path: go-consumer
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify Go consumer revision
+        run: test "$(git -C go-consumer rev-parse HEAD)" = "$SAGE_CONSUMER_SHA"
+      - name: Set up Go for consumer gate
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.5'
+          cache-dependency-path: go-consumer/go.sum
+      - name: Generate strict Sage v2 events with the production Go writer
+        run: |
+          cd go-consumer
+          SAGE_NATIVE_FIXTURE_DIR="${GITHUB_WORKSPACE}/synthetic-sage-events-v2" \
+            go test ./adapter/outboundgroup -run '^TestSageNativeExternalTrainingFixture$' -count=1
+          test -n "$(find "${GITHUB_WORKSPACE}/synthetic-sage-events-v2" -type f -name 'sage-native-v2.*.jsonl.ready' -print -quit)"
+      - name: Train synthetic Sage P1 bundle
+        run: |
+          python smart_trainer/train_sage_prior.py \
+            --data-dir synthetic-sage-events-v2 --output SagePrior.json \
+            --evidence-output SagePrior.evidence.json \
+            --parity-output SagePrior.parity.json \
+            --log-file smart_trainer/training_sage.log \
+            --training-commit "$GITHUB_SHA" --consumer-commit "$SAGE_CONSUMER_SHA"
+      - name: Verify synthetic bundle with real consumer
+        run: |
+          mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json)
+          mkdir -p go-consumer/prior-integration
+          cp SagePrior.json SagePrior.parity.json "${MODELS[@]}" go-consumer/prior-integration/
+          BUNDLE_PATH="$(pwd)/go-consumer/prior-integration/SagePrior.json"
+          PARITY_PATH="$(pwd)/go-consumer/prior-integration/SagePrior.parity.json"
+          cd go-consumer
+          SAGE_PRIOR_BUNDLE="$BUNDLE_PATH" SAGE_PRIOR_PARITY="$PARITY_PATH" \
+            go test ./adapter/outboundgroup -run '^(TestSagePriorExternalBundle|TestSagePriorExternalPredictionParity)$' -count=1
+      - name: Cleanup synthetic gate
+        if: always()
+        run: rm -rf synthetic-sage-events-v2 go-consumer SagePrior*.lgb SagePrior.json SagePrior.evidence.json SagePrior.parity.json smart_trainer/training_sage.log
+
+  train_and_deploy:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       failed_step: ${{ steps.record_result.outputs.failed_step }}
       release_tag: ${{ steps.record_result.outputs.release_tag }}
       bundle_sha: ${{ steps.record_result.outputs.bundle_sha }}
     env:
-      RELEASE_TAG: sage-prior-model-${{ github.run_number }}
-      SAGE_CONSUMER_SHA: 9c92dbf80c8997bbfe1a2f4e986aa45f75f3a786
+      RELEASE_TAG: sage-prior-v2-model-${{ github.run_number }}
 
     steps:
       - name: Checkout repository at triggering commit
@@ -64,7 +136,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Pull immutable native-event snapshot
+      - name: Pull immutable real Sage v2 event snapshot
         id: pull_snapshot
         env:
           RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
@@ -73,19 +145,20 @@ jobs:
           umask 077
           trap 'rm -f rclone.conf' EXIT
           echo "$RCLONE_CONFIG_B64" | base64 -d > rclone.conf
-          mkdir -p sage-data
-          rclone copy "${REMOTE}/sage-native" "${GITHUB_WORKSPACE}/sage-data" \
+          mkdir -p sage-data-v2
+          rclone copy "${REMOTE}/sage-native-v2" "${GITHUB_WORKSPACE}/sage-data-v2" \
             --config rclone.conf --transfers=4 --checkers=8 --log-level=INFO \
-            --include "*.jsonl.ready" --include "*.jsonl.failed" --include "*.jsonl.recovered"
-          test -n "$(find sage-data -type f -name '*.jsonl.ready' -print -quit)" || { echo "::error::No closed Sage native-event files found."; exit 1; }
+            --include "sage-native-v2.*.jsonl.ready" --include "sage-native-v2.*.jsonl.failed" --include "sage-native-v2.*.jsonl.recovered"
+          test -n "$(find sage-data-v2 -type f -name 'sage-native-v2.*.jsonl.ready' -print -quit)" || { echo "::error::No closed Sage v2 native-event files found."; exit 1; }
 
       - name: Train four native dimensional priors
         id: train
         run: |
           set -o pipefail
           python smart_trainer/train_sage_prior.py \
-            --data-dir sage-data --output SagePrior.json \
+            --data-dir sage-data-v2 --output SagePrior.json \
             --evidence-output SagePrior.evidence.json \
+            --parity-output SagePrior.parity.json \
             --log-file smart_trainer/training_sage.log \
             --training-commit "$GITHUB_SHA" --consumer-commit "$SAGE_CONSUMER_SHA"
 
@@ -115,25 +188,27 @@ jobs:
         run: |
           mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json)
           mkdir -p go-consumer/prior-integration
-          cp SagePrior.json "${MODELS[@]}" go-consumer/prior-integration/
+          cp SagePrior.json SagePrior.parity.json "${MODELS[@]}" go-consumer/prior-integration/
           BUNDLE_PATH="$(pwd)/go-consumer/prior-integration/SagePrior.json"
+          PARITY_PATH="$(pwd)/go-consumer/prior-integration/SagePrior.parity.json"
           cd go-consumer
-          SAGE_PRIOR_BUNDLE="$BUNDLE_PATH" go test ./adapter/outboundgroup -run TestSagePriorExternalBundle -count=1
+          SAGE_PRIOR_BUNDLE="$BUNDLE_PATH" SAGE_PRIOR_PARITY="$PARITY_PATH" \
+            go test ./adapter/outboundgroup -run '^(TestSagePriorExternalBundle|TestSagePriorExternalPredictionParity)$' -count=1
 
       - name: Build self-contained prior bundle
         id: build_bundle
         run: |
           mapfile -t MODELS < <(jq -r '.dimensions[].model' SagePrior.json | sort)
           TZ=UTC touch -t 198001010000 SagePrior.json SagePrior.evidence.json "${MODELS[@]}"
-          zip -X -j SagePrior-v1.zip SagePrior.json SagePrior.evidence.json "${MODELS[@]}"
-          sha256sum SagePrior-v1.zip > SagePrior-v1.zip.sha256
-          BUNDLE_SHA="$(cut -d ' ' -f1 SagePrior-v1.zip.sha256)"
+          zip -X -j SagePrior-v2.zip SagePrior.json SagePrior.evidence.json "${MODELS[@]}"
+          sha256sum SagePrior-v2.zip > SagePrior-v2.zip.sha256
+          BUNDLE_SHA="$(cut -d ' ' -f1 SagePrior-v2.zip.sha256)"
           echo "BUNDLE_SHA=$BUNDLE_SHA" >> "$GITHUB_ENV"
           {
             echo "========================================================================"
             echo "[步骤6] 构建可发布模型包"
             echo "========================================================================"
-            echo "📦 bundle: $(cat SagePrior-v1.zip.sha256)"
+            echo "📦 bundle: $(cat SagePrior-v2.zip.sha256)"
             echo "📌 trainer: ${GITHUB_SHA}"
             echo "📌 consumer: ${SAGE_CONSUMER_SHA}"
           } | tee -a smart_trainer/training_sage.log
@@ -142,19 +217,20 @@ jobs:
         id: upload_bundle
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: sage-prior-bundle-${{ github.run_attempt }}
+          name: sage-prior-v2-bundle-${{ github.run_attempt }}
           path: |
-            SagePrior-v1.zip
-            SagePrior-v1.zip.sha256
+            SagePrior-v2.zip
+            SagePrior-v2.zip.sha256
 
       - name: Upload detailed Sage training evidence
         id: upload_training_evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: sage-training-evidence-${{ github.run_attempt }}
+          name: sage-prior-v2-training-evidence-${{ github.run_attempt }}
           path: |
             smart_trainer/training_sage.log
             SagePrior.evidence.json
+            SagePrior.parity.json
 
       - name: Publish Sage prior bundle
         id: publish_release
@@ -162,21 +238,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          RELEASE_NOTES="Sage 原生四维先验自动训练完成。<br><br>Trainer commit: ${GITHUB_SHA}<br>Consumer commit: ${SAGE_CONSUMER_SHA}<br>Run ID: ${{ github.run_id }}<br>Bundle SHA256: ${BUNDLE_SHA}<br><br>训练证据见 SagePrior.evidence.json；只消费 native event schema，与 PLD PriorModel.bin 互不覆盖。"
+          RELEASE_NOTES="Sage P1 原生四维先验自动训练完成。<br><br>Trainer commit: ${GITHUB_SHA}<br>Consumer commit: ${SAGE_CONSUMER_SHA}<br>Run ID: ${{ github.run_id }}<br>Bundle SHA256: ${BUNDLE_SHA}<br><br>只消费 sage-native-events-v2，与 PLD PriorModel.bin 互不覆盖。"
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
             test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq '.targetCommitish')" = "$GITHUB_SHA"
           else
-            gh release create "$RELEASE_TAG" --title "Sage Dimensional Priors" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA" --draft
+            gh release create "$RELEASE_TAG" --title "Sage P1 Dimensional Priors" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA" --draft
           fi
-          gh release upload "$RELEASE_TAG" SagePrior-v1.zip SagePrior-v1.zip.sha256 --clobber
-          test "$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort | join(",")')" = "SagePrior-v1.zip,SagePrior-v1.zip.sha256"
+          gh release upload "$RELEASE_TAG" SagePrior-v2.zip SagePrior-v2.zip.sha256 --clobber
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort | join(",")')" = "SagePrior-v2.zip,SagePrior-v2.zip.sha256"
           VERIFY_DIR="$(mktemp -d)"
           trap 'rm -rf "$VERIFY_DIR"' EXIT
-          gh release download "$RELEASE_TAG" --dir "$VERIFY_DIR" --pattern 'SagePrior-v1.zip*'
-          (cd "$VERIFY_DIR" && sha256sum --check SagePrior-v1.zip.sha256)
-          cmp SagePrior-v1.zip "$VERIFY_DIR/SagePrior-v1.zip"
-          cmp SagePrior-v1.zip.sha256 "$VERIFY_DIR/SagePrior-v1.zip.sha256"
+          gh release download "$RELEASE_TAG" --dir "$VERIFY_DIR" --pattern 'SagePrior-v2.zip*'
+          (cd "$VERIFY_DIR" && sha256sum --check SagePrior-v2.zip.sha256)
+          cmp SagePrior-v2.zip "$VERIFY_DIR/SagePrior-v2.zip"
+          cmp SagePrior-v2.zip.sha256 "$VERIFY_DIR/SagePrior-v2.zip.sha256"
           gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES" --draft=false --latest=false
 
       - name: Preserve Sage evidence after failure
@@ -184,16 +260,17 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: sage-training-failed-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sage-prior-v2-training-failed-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             smart_trainer/training_sage.log
             SagePrior.evidence.json
+            SagePrior.parity.json
           if-no-files-found: warn
 
       - name: Cleanup
         id: cleanup
         if: always()
-        run: rm -rf rclone.conf sage-data go-consumer SagePrior*.lgb SagePrior.json SagePrior.evidence.json SagePrior-v1.zip* smart_trainer/training_sage.log
+        run: rm -rf rclone.conf sage-data-v2 go-consumer SagePrior*.lgb SagePrior.json SagePrior.evidence.json SagePrior.parity.json SagePrior-v2.zip* smart_trainer/training_sage.log
 
       - name: Record final result for independent notification
         id: record_result
@@ -208,7 +285,7 @@ jobs:
 
   notify:
     needs: train_and_deploy
-    if: always()
+    if: github.event_name != 'push' && always()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout notifier at triggering commit
@@ -229,7 +306,6 @@ jobs:
           FAILED_STEP: ${{ needs.train_and_deploy.outputs.failed_step }}
           RELEASE_TAG: ${{ needs.train_and_deploy.outputs.release_tag }}
           BUNDLE_SHA: ${{ needs.train_and_deploy.outputs.bundle_sha }}
-          SAGE_CONSUMER_SHA: 9c92dbf80c8997bbfe1a2f4e986aa45f75f3a786
         run: |
           set +x
           if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then

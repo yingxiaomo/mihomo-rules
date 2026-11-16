@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Train four priors from Sage native events; PLD is never accepted."""
 from __future__ import annotations
-import argparse, bisect, hashlib, json, logging, os, shutil, sys, tempfile, time, traceback
+import argparse, bisect, hashlib, json, logging, math, os, shutil, sys, tempfile, time, traceback
 from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-SCHEMA_VERSION=2; SOURCE_SCHEMA="sage-native-events-v1"; FEATURE_SCHEMA="sage-prior-native-features-v1"
+SCHEMA_VERSION=3; SOURCE_SCHEMA="sage-native-events-v2"; FEATURE_SCHEMA="sage-prior-native-features-v2"
 MAX_PRIOR_CONFIDENCE=.35; MIN_TRAIN_ROWS=20; MIN_VALID_ROWS=5; MIN_CONFIDENCE_ROWS=20
-FEATURE_ORDER=["is_udp","is_tcp","port_log","asn_hash","host_hash","ip_hash","group_hash","node_type"]
+FEATURE_ORDER=["is_udp","is_tcp","port_log","asn_category","host_category","ip_category","group_category","node_type_category","node_identity_category_a","node_identity_category_b","scene_category"]
+CATEGORICAL_FEATURES=FEATURE_ORDER[3:]
+MAX_CATEGORICAL_VALUE=2_147_483_647
+CONNECT_BOUNDARIES=("dial_return","first_positive_write","first_positive_datagram")
+CONNECT_SEMANTICS="successful_availability_elapsed_v1"
+LABEL_SEMANTICS={"connect":"successful_availability_duration","response":"first_positive_response_duration","throughput":"active_segment_goodput","failure":"terminal_attempt_failure"}
 DIMENSIONS=("connect","response","throughput","failure"); PARTITIONS=("train","early_stop","calibration","final_test")
 FAILURE_MIN_CLASS_ATTEMPTS={"train":8,"early_stop":8,"calibration":3,"final_test":3}
 MODEL_PARAMS={"verbosity":-1,"learning_rate":.035,"num_leaves":24,"min_data_in_leaf":12,"feature_fraction":.9,"bagging_fraction":.9,"bagging_freq":1,"lambda_l1":.1,"lambda_l2":.5,"seed":20261115,"feature_fraction_seed":20261115,"bagging_seed":20261115,"data_random_seed":20261115,"deterministic":True,"force_col_wise":True,"num_threads":1}
-ALGORITHM_CONTRACT={"name":"sage-prior-training-v2","source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"feature_order":FEATURE_ORDER,"dimensions":DIMENSIONS,"partitions":PARTITIONS,"partition_ratios":[.60,.15,.10,.15],"minimum_partition_attempts":{"train":MIN_TRAIN_ROWS,"early_stop":MIN_VALID_ROWS,"calibration":MIN_VALID_ROWS,"final_test":MIN_VALID_ROWS},"partition_ties":"same decision_unix_nano group is never split; choose nearest feasible group-safe cuts","attempt_context":"exactly one decision event; label decision_unix_nano, transport and features must match; observed_unix_nano >= decision_unix_nano","failure_min_positive_attempts":FAILURE_MIN_CLASS_ATTEMPTS,"late_label_rule":"observed_unix_nano < next_partition_decision_unix_nano; no refill","throughput_weight":"sum per attempt = 1","baselines":{"regression":"train weighted median","failure":"train weighted failure prevalence"},"failure_calibration":"logistic regression on calibration raw score when calibration positives >= 3 and both classes exist","confidence":"min(0.35,max(0,1-model_error/baseline_error)); failure class gate and final_test>=20","model_params":MODEL_PARAMS}
+ALGORITHM_CONTRACT={"name":"sage-prior-training-v3","source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"feature_order":FEATURE_ORDER,"categorical_features":CATEGORICAL_FEATURES,"connect_semantics":CONNECT_SEMANTICS,"label_semantics":LABEL_SEMANTICS,"dimensions":DIMENSIONS,"partitions":PARTITIONS,"partition_ratios":[.60,.15,.10,.15],"minimum_partition_attempts":{"train":MIN_TRAIN_ROWS,"early_stop":MIN_VALID_ROWS,"calibration":MIN_VALID_ROWS,"final_test":MIN_VALID_ROWS},"partition_ties":"same decision_unix_nano group is never split; choose nearest feasible group-safe cuts","attempt_context":"exactly one decision event; every event must match decision_unix_nano, transport, features, group_id, node_id, node_id_stable, privacy_key_id and scene; node_id_stable is a strict JSON boolean; observed_unix_nano >= decision_unix_nano","identity_eligibility":"stable non-empty privacy_key_id/node_id and nonzero node type/identity categories; stable identity and identity category pair must form a collision-free bijection within input","connect_label":"event_type=connect, metric=connect, allowed boundary, elapsed_nano/1e6; setup never labels connect","failure_min_class_attempts":FAILURE_MIN_CLASS_ATTEMPTS,"late_label_rule":"observed_unix_nano < next_partition_decision_unix_nano; no refill","throughput_weight":"sum per attempt = 1","baselines":{"regression":"train weighted median","failure":"train weighted failure prevalence"},"failure_calibration":"logistic regression on calibration raw score only when both success and failure meet the partition class minimum","confidence":"min(0.35,max(0,1-model_error/baseline_error)); failure class gate requires both classes in every partition and final_test>=20","model_params":MODEL_PARAMS}
 ALGORITHM_SIGNATURE=hashlib.sha256(json.dumps(ALGORITHM_CONTRACT,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode()).hexdigest()
 
 LOGGER = logging.getLogger("sage_prior_trainer")
@@ -49,7 +54,19 @@ def _format_ns(value):
  if value is None:return "结束"
  return time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime(int(value)/1_000_000_000))
 
-def _canonical(e): return json.dumps(e,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+def _canonical(e): return json.dumps(e,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode()
+
+def _reject_json_constant(value):
+ raise ValueError(f"JSON 常量 {value} 非法")
+
+def _validated_features(value,where="feature"):
+ if not isinstance(value,(list,tuple)) or len(value)!=len(FEATURE_ORDER):raise ValueError(f"{where} ABI 无效")
+ try:values=np.asarray(value,float)
+ except (TypeError,ValueError) as exc:raise ValueError(f"{where} ABI 无效") from exc
+ if not np.isfinite(values).all():raise ValueError(f"{where} 必须全部有限")
+ for name,raw in zip(CATEGORICAL_FEATURES,values[3:]):
+  if not float(raw).is_integer() or raw<0 or raw>MAX_CATEGORICAL_VALUE:raise ValueError(f"{where} categorical {name} 必须是 0..{MAX_CATEGORICAL_VALUE} 的整数")
+ return values
 
 def load_native_events(data_dir):
  root=Path(data_dir)
@@ -58,9 +75,9 @@ def load_native_events(data_dir):
  compromised=set()
  for marker in [*root.rglob("*.jsonl.failed"),*root.rglob("*.jsonl.recovered")]:
   parts=marker.name.split(".")
-  if len(parts)<3 or parts[0]!="sage-native-v1": raise ValueError(f"无法识别损坏采集文件 {marker}")
+  if len(parts)<3 or parts[0]!="sage-native-v2": raise ValueError(f"无法识别损坏采集文件 {marker}")
   compromised.add(parts[1])
- files=sorted(p for p in root.rglob("*.jsonl.ready") if p.is_file() and (len(p.name.split("."))<2 or p.name.split(".")[1] not in compromised))
+ files=sorted(p for p in root.rglob("sage-native-v2.*.jsonl.ready") if p.is_file() and (len(p.name.split("."))<2 or p.name.split(".")[1] not in compromised))
  if not files: raise ValueError("未找到 Sage 原生 .jsonl.ready 数据")
  LOGGER.info(f"📦 可用闭合文件: {len(files)} 个 | 隔离 run: {len(compromised)} 个")
  by_id={};file_summaries=[]
@@ -69,8 +86,8 @@ def load_native_events(data_dir):
   with path.open(encoding="utf-8") as stream:
    for no,raw in enumerate(stream,1):
     if not raw.endswith("\n"): raise ValueError(f"{path}:{no} 非完整 JSONL")
-    try:e=json.loads(raw)
-    except json.JSONDecodeError as exc: raise ValueError(f"{path}:{no} JSON 无效") from exc
+    try:e=json.loads(raw,parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError,ValueError) as exc: raise ValueError(f"{path}:{no} JSON 无效") from exc
     if not isinstance(e,dict) or e.get("source_schema")!=SOURCE_SCHEMA: raise ValueError(f"{path}:{no} source_schema 不兼容")
     kind=e.get("event_type")
     if kind=="file_header":
@@ -83,7 +100,7 @@ def load_native_events(data_dir):
     if not header or footer or str(e.get("run_id",""))!=run_id: raise ValueError(f"{path}:{no} 文件边界/run_id 无效")
     feat=e.get("features"); event_id=str(e.get("event_id","")); attempt_id=str(e.get("attempt_id",""))
     if e.get("feature_schema")!=FEATURE_SCHEMA or not event_id or not attempt_id: raise ValueError(f"{path}:{no} 事件 ABI 无效")
-    if not isinstance(feat,list) or len(feat)!=8 or not np.isfinite(np.asarray(feat,float)).all(): raise ValueError(f"{path}:{no} feature ABI 无效")
+    _validated_features(feat,f"{path}:{no} feature")
     local.append(e)
   if not header or not footer or footer_event is None: raise ValueError(f"{path} 缺少 header/footer")
   sequences=[int(e["event_seq"]) for e in local]
@@ -112,11 +129,10 @@ def load_native_events(data_dir):
 def build_features(events):
  rows=[]
  for i,v in events.features.items():
-  if not isinstance(v,(list,tuple)) or len(v)!=8: raise ValueError(f"事件 {i} feature ABI 错误")
-  a=np.asarray(v,float)
-  if not np.isfinite(a).all(): raise ValueError(f"事件 {i} feature 非有限")
-  rows.append(a)
- return pd.DataFrame(rows,columns=FEATURE_ORDER,index=events.index)
+  rows.append(_validated_features(v,f"事件 {i} feature"))
+ frame=pd.DataFrame(rows,columns=FEATURE_ORDER,index=events.index)
+ frame[CATEGORICAL_FEATURES]=frame[CATEGORICAL_FEATURES].astype(np.int64)
+ return frame
 
 def _global_attempts(events):
  return events.groupby("attempt_id",as_index=False).agg(decision_unix_nano=("decision_unix_nano","min")).sort_values(["decision_unix_nano","attempt_id"],kind="stable").reset_index(drop=True)
@@ -168,13 +184,33 @@ def _attempt_partitions(events):
 def _validated_attempt_context(events):
  decisions=events.loc[events.event_type.eq("decision")].copy();counts=decisions.groupby("attempt_id").size();all_attempts=set(events.attempt_id.astype(str));missing=sorted(all_attempts-set(counts.index.astype(str)));duplicates=sorted(counts.loc[counts.ne(1)].index.astype(str))
  if missing or duplicates:raise ValueError(f"attempt decision 事件必须恰好一条: missing={missing[:5]} duplicates={duplicates[:5]}")
- canonical=decisions.set_index("attempt_id");work=events.copy();decision_map=work.attempt_id.map(canonical.decision_unix_nano);transport_map=work.attempt_id.map(canonical.transport);feature_map=work.attempt_id.map(canonical.features)
- bad_time=work.decision_unix_nano.ne(decision_map);bad_transport=work.transport.ne(transport_map);bad_features=pd.Series([_canonical(left)!=_canonical(right) for left,right in zip(work.features,feature_map)],index=work.index);bad_observed=work.observed_unix_nano.lt(decision_map)
+ canonical=decisions.set_index("attempt_id");work=events.copy()
+ for index,value in work.features.items():_validated_features(value,f"事件 {index} feature")
+ decision_map=work.attempt_id.map(canonical.decision_unix_nano)
+ bad_fields=[]
+ for field in ("transport","group_id","node_id","node_id_stable","privacy_key_id","scene"):
+  if field not in work.columns:raise ValueError(f"attempt context 缺少 {field}")
+  expected=work.attempt_id.map(canonical[field]);bad=work[field].ne(expected)
+  if bad.any():bad_fields.append((field,work.loc[bad,"attempt_id"].astype(str).drop_duplicates().tolist()[:5]))
+ feature_map=work.attempt_id.map(canonical.features);bad_features=pd.Series([_canonical(left)!=_canonical(right) for left,right in zip(work.features,feature_map)],index=work.index);bad_time=work.decision_unix_nano.ne(decision_map);bad_observed=work.observed_unix_nano.lt(decision_map)
  if bad_time.any():raise ValueError(f"attempt 标签 decision_unix_nano 与 decision 事件不一致: {work.loc[bad_time,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
- if bad_transport.any():raise ValueError(f"attempt 标签 transport 与 decision 事件不一致: {work.loc[bad_transport,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ if bad_fields:raise ValueError("attempt context 与 decision 事件不一致: "+"; ".join(f"{field}={attempts}" for field,attempts in bad_fields))
  if bad_features.any():raise ValueError(f"attempt 标签 features 与 decision 事件不一致: {work.loc[bad_features,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
  if bad_observed.any():raise ValueError(f"事件 observed_unix_nano 早于 decision: {work.loc[bad_observed,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
- work["decision_unix_nano"]=decision_map.astype(np.int64);work["transport"]=transport_map;work["features"]=feature_map
+ identities_by_pair={}
+ pairs_by_identity={}
+ stable_values=work["node_id_stable"].map(lambda value:type(value) is bool)
+ if not stable_values.all():raise ValueError(f"node_id_stable 必须是 JSON boolean: {work.loc[~stable_values,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ for _,row in decisions.iterrows():
+  privacy=str(row.get("privacy_key_id","") or "").strip();node=str(row.get("node_id","") or "").strip();stable=bool(row.get("node_id_stable",False))
+  values=_validated_features(row.features,"decision feature");pair=(int(values[8]),int(values[9]))
+  if not stable or not privacy or not node or pair==(0,0):continue
+  identity=(privacy,node);previous_identity=identities_by_pair.get(pair);previous_pair=pairs_by_identity.get(identity)
+  if previous_identity is not None and previous_identity!=identity:raise ValueError(f"node identity category pair 碰撞: pair={pair} identities={previous_identity},{identity}")
+  if previous_pair is not None and previous_pair!=pair:raise ValueError(f"node identity category pair 不稳定: identity={identity} pairs={previous_pair},{pair}")
+  identities_by_pair[pair]=identity;pairs_by_identity[identity]=pair
+ work["decision_unix_nano"]=decision_map.astype(np.int64);work["features"]=feature_map
+ for field in ("transport","group_id","node_id","node_id_stable","privacy_key_id","scene"):work[field]=work.attempt_id.map(canonical[field])
  return work
 
 def _failure_class_gate(table):
@@ -184,7 +220,8 @@ def _failure_class_gate(table):
   frame=table.loc[table.partition.eq(part),["attempt_id","label"]].drop_duplicates()
   success=int(frame.loc[frame.label.eq(0),"attempt_id"].nunique());failure=int(frame.loc[frame.label.eq(1),"attempt_id"].nunique());required=FAILURE_MIN_CLASS_ATTEMPTS[part]
   counts[part]={"success":success,"failure":failure}
-  if failure<required:deficits.append({"partition":part,"class":"failure","actual":failure,"required":required,"missing":required-failure})
+  for class_name,actual in (("success",success),("failure",failure)):
+   if actual<required:deficits.append({"partition":part,"class":class_name,"actual":actual,"required":required,"missing":required-actual})
  return {"passed":not deficits,"minimums":dict(FAILURE_MIN_CLASS_ATTEMPTS),"counts":counts,"deficits":deficits}
 
 def _dimension_preflight(name,table):
@@ -208,7 +245,7 @@ def preflight_training_tables(tables):
   if missing:blocking.append(f"{name}: "+", ".join(missing))
   if name=="failure":
    gate=evidence["class_gate"]
-   LOGGER.info("🧪 failure 类别: "+" | ".join(f"{part}=success:{gate['counts'][part]['success']},failure:{gate['counts'][part]['failure']},required_failure:{gate['minimums'][part]}" for part in PARTITIONS))
+   LOGGER.info("🧪 failure 类别: "+" | ".join(f"{part}=success:{gate['counts'][part]['success']},failure:{gate['counts'][part]['failure']},required_each:{gate['minimums'][part]}" for part in PARTITIONS))
    if gate["deficits"]:LOGGER.warning("⚠️ failure 类别门禁不足，confidence 将强制为 0: "+json.dumps(gate["deficits"],ensure_ascii=False,separators=(",",":")))
  if blocking:raise ValueError("四维训练预检失败: "+"; ".join(blocking))
  LOGGER.info("✅ 四维总量预检通过，开始训练")
@@ -216,20 +253,25 @@ def preflight_training_tables(tables):
 
 def build_training_tables(events):
  LOGGER.info("[步骤2] 按各维有效标签 attempt 独立时间切分并构造四维标签")
- required={"attempt_id","event_type","decision_unix_nano","observed_unix_nano","transport","features"}
+ required={"attempt_id","event_type","decision_unix_nano","observed_unix_nano","transport","features","group_id","node_id","node_id_stable","privacy_key_id","scene"}
  if required-set(events.columns): raise ValueError(f"缺少字段 {sorted(required-set(events.columns))}")
  work=_validated_attempt_context(events);attempts=_global_attempts(work);features=build_features(work)
  LOGGER.info(f"🧩 全局独立 attempt: {len(attempts)}")
  LOGGER.info("🧹 各维边界依据=有效标签 attempt 的 decision_unix_nano；迟到过滤严格要求 observed_unix_nano < 下一分区边界；过滤后不补位")
  for name in FEATURE_ORDER: work[name]=features[name]
  empty=pd.Series(index=work.index,dtype=object)
- specs={"connect":(work.event_type.eq("setup")&work.get("setup_status",empty).eq("returned"),"log_milliseconds"),"response":(work.event_type.eq("response")&work.transport.eq("tcp"),"log_milliseconds"),"throughput":(work.event_type.eq("throughput")&work.transport.eq("tcp"),"log_bits_per_second"),"failure":(work.event_type.eq("outcome")&work.get("outcome",empty).isin(["success","failure"]),"probability")}
+ eligible_identity=work.node_id_stable.eq(True)&work.node_id.fillna("").astype(str).str.strip().ne("")&work.privacy_key_id.fillna("").astype(str).str.strip().ne("")&work.node_type_category.ne(0)&work.node_identity_category_a.ne(0)&work.node_identity_category_b.ne(0)
+ specs={"connect":(work.event_type.eq("connect")&work.get("metric",empty).eq("connect")&work.get("boundary",empty).isin(CONNECT_BOUNDARIES),"log_milliseconds"),"response":(work.event_type.eq("response")&work.transport.eq("tcp"),"log_milliseconds"),"throughput":(work.event_type.eq("throughput")&work.transport.eq("tcp"),"log_bits_per_second"),"failure":(work.event_type.eq("outcome")&work.get("outcome",empty).isin(["success","failure"]),"probability")}
  tables={}
  for name,(mask,unit) in specs.items():
-  table=work.loc[mask].copy();candidates=len(table);value=pd.to_numeric(table.get("value"),errors="coerce")
-  if name in ("connect","response"): valid=value.gt(0)&value.le(30000); table["label"]=np.log(value.clip(1,30000))
-  elif name=="throughput": valid=value.ge(8192)&value.le(1e9)&pd.to_numeric(table.get("bytes"),errors="coerce").ge(65536)&pd.to_numeric(table.get("elapsed_nano"),errors="coerce").ge(2e9); table["label"]=np.log(value.clip(8192,1e9))
+  table=work.loc[mask].copy();candidates=len(table);value=pd.to_numeric(table["value"],errors="coerce") if "value" in table else pd.Series(np.nan,index=table.index)
+  if name=="connect":
+   elapsed=pd.to_numeric(table["elapsed_nano"],errors="coerce") if "elapsed_nano" in table else pd.Series(np.nan,index=table.index);milliseconds=elapsed/1_000_000.;valid=milliseconds.ge(0)&milliseconds.le(30000);table["label"]=np.log(milliseconds.clip(1,30000))
+  elif name=="response":valid=value.gt(0)&value.le(30000);table["label"]=np.log(value.clip(1,30000))
+  elif name=="throughput":
+   byte_count=pd.to_numeric(table["bytes"],errors="coerce") if "bytes" in table else pd.Series(np.nan,index=table.index);elapsed=pd.to_numeric(table["elapsed_nano"],errors="coerce") if "elapsed_nano" in table else pd.Series(np.nan,index=table.index);valid=value.ge(8192)&value.le(1e9)&byte_count.ge(65536)&elapsed.ge(2e9);table["label"]=np.log(value.clip(8192,1e9))
   else: valid=table.get("outcome",empty).isin(["success","failure"]); table["label"]=table.get("outcome",empty).map({"success":0.,"failure":1.})
+  valid &= eligible_identity.loc[table.index]
   table=table.loc[valid&table[FEATURE_ORDER].notna().all(axis=1)].copy();invalid_dropped=candidates-len(table)
   if name=="failure":
    conflicts=table.groupby("attempt_id").label.nunique();conflicts=conflicts.loc[conflicts.gt(1)]
@@ -269,7 +311,7 @@ def train_dimension(name,table,preflight=None):
  LOGGER.info(f"🏷️ 标签: rows={len(table)} | min={table.label.min():.6f} | p50={table.label.median():.6f} | p95={table.label.quantile(.95):.6f} | max={table.label.max():.6f}")
  if name=="failure":LOGGER.info(f"⚖️ 失败标签: success={int((table.label==0).sum())} | failure={int((table.label==1).sum())}")
  LOGGER.info(f"🌲 LightGBM: objective={objective} | metric={metric} | max_rounds=600 | early_stopping=40 | learning_rate={params['learning_rate']} | features={len(FEATURE_ORDER)}")
- ds=lgb.Dataset(train[FEATURE_ORDER],label=train.label,weight=train.weight,feature_name=FEATURE_ORDER);es=lgb.Dataset(early[FEATURE_ORDER],label=early.label,weight=early.weight,reference=ds,feature_name=FEATURE_ORDER)
+ ds=lgb.Dataset(train[FEATURE_ORDER],label=train.label,weight=train.weight,feature_name=FEATURE_ORDER,categorical_feature=CATEGORICAL_FEATURES);es=lgb.Dataset(early[FEATURE_ORDER],label=early.label,weight=early.weight,reference=ds,feature_name=FEATURE_ORDER,categorical_feature=CATEGORICAL_FEATURES)
  model=lgb.train(params,ds,num_boost_round=600,valid_sets=[es],valid_names=["early_stop"],callbacks=[lgb.early_stopping(40,verbose=True),lgb.log_evaluation(50)])
  LOGGER.info(f"🏆 {name} 最佳迭代: {model.best_iteration}")
  final=parts["final_test"];truth,weights=final.label.to_numpy(float),final.weight.to_numpy(float);ty,tw=train.label.to_numpy(float),train.weight.to_numpy(float);transform,scale,bias="identity",1.,0.;class_gate=None
@@ -286,7 +328,7 @@ def train_dimension(name,table,preflight=None):
  improvement=(1-error/base_error) if np.isfinite(base_error) and base_error>1e-12 else float("nan")
  LOGGER.info(f"📏 朴素基线: strategy={baseline_strategy} | prediction={base:.9f}")
  LOGGER.info(f"🧪 最终验证: metric={metric_name} | model_error={error:.9f} | baseline_error={base_error:.9f} | improvement={improvement:.2%}")
- if name=="failure" and not class_gate_passed:reason="failure 类别门禁不足: "+", ".join(f"{d['partition']} failure {d['actual']}/{d['required']} (缺 {d['missing']})" for d in class_gate["deficits"])
+ if name=="failure" and not class_gate_passed:reason="failure 类别门禁不足: "+", ".join(f"{d['partition']} {d['class']} {d['actual']}/{d['required']} (缺 {d['missing']})" for d in class_gate["deficits"])
  elif not calibrated:reason="校准集类别不足或校准斜率无效"
  elif counts["final_test"]<MIN_CONFIDENCE_ROWS:reason=f"final_test 独立 attempt {counts['final_test']} < {MIN_CONFIDENCE_ROWS}"
  elif not np.isfinite(error):reason="model_error 非有限"
@@ -296,7 +338,7 @@ def train_dimension(name,table,preflight=None):
  LOGGER.info(f"🛡️ confidence={confidence:.6f} / cap={MAX_PRIOR_CONFIDENCE:.2f} | gate={reason}")
  if name=="failure":LOGGER.info(f"🎛️ failure calibration: calibrated={calibrated} | class_gate={class_gate_passed} | scale={scale:.12f} | bias={bias:.12f}")
  training_evidence={**evidence,"confidence_gate":reason,"confidence":confidence,"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9)}
- return model,{"unit":str(table.unit.iloc[0]),"confidence":confidence,"train_samples":counts["train"],"early_stop_samples":counts["early_stop"],"calibration_samples":counts["calibration"],"validation_samples":counts["final_test"],"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9),"output_transform":transform,"calibration_scale":round(scale,12),"calibration_bias":round(bias,12),"_evidence":training_evidence}
+ return model,{"unit":str(table.unit.iloc[0]),"label_semantics":LABEL_SEMANTICS[name],"confidence":confidence,"train_samples":counts["train"],"early_stop_samples":counts["early_stop"],"calibration_samples":counts["calibration"],"validation_samples":counts["final_test"],"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9),"output_transform":transform,"calibration_scale":round(scale,12),"calibration_bias":round(bias,12),"_evidence":training_evidence}
 
 def _sha256(path):
  h=hashlib.sha256()
@@ -315,8 +357,8 @@ def save_bundle(output,attempts,models,metadata):
    runtime_metadata={key:value for key,value in metadata[name].items() if not key.startswith("_")}
    dimensions[name]={**runtime_metadata,"model":target.name,"sha256":digest}
    LOGGER.info(f"  ✓ {name:<10} {target.name} | {target.stat().st_size} bytes | sha256={digest}")
-  manifest={"schema_version":SCHEMA_VERSION,"feature_schema":FEATURE_SCHEMA,"source_schema":SOURCE_SCHEMA,"feature_order":FEATURE_ORDER,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"max_prior_confidence":MAX_PRIOR_CONFIDENCE,"dimensions":dimensions}
-  temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2)+"\n",encoding="utf-8");os.replace(temp,output)
+  manifest={"schema_version":SCHEMA_VERSION,"feature_schema":FEATURE_SCHEMA,"source_schema":SOURCE_SCHEMA,"feature_order":FEATURE_ORDER,"categorical_features":CATEGORICAL_FEATURES,"connect_semantics":CONNECT_SEMANTICS,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"max_prior_confidence":MAX_PRIOR_CONFIDENCE,"dimensions":dimensions}
+  temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False)+"\n",encoding="utf-8");os.replace(temp,output)
   LOGGER.info(f"📦 manifest: {output} | {output.stat().st_size} bytes | sha256={_sha256(output)} | generated_from={manifest['generated_from_event_unix']}")
   LOGGER.info("📈 四维 confidence: "+" | ".join(f"{name}={dimensions[name]['confidence']:.6f}" for name in DIMENSIONS))
   return manifest
@@ -328,10 +370,24 @@ def save_bundle(output,attempts,models,metadata):
 def save_training_evidence(output,attempts,metadata,provenance=None):
  output=Path(output).resolve();output.parent.mkdir(parents=True,exist_ok=True)
  dimensions={name:metadata[name]["_evidence"] for name in DIMENSIONS}
- manifest={"evidence_schema":"sage-prior-training-evidence-v1","algorithm_signature":ALGORITHM_SIGNATURE,"algorithm_contract":ALGORITHM_CONTRACT,"source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"provenance":provenance or {"training_commit":None,"consumer_commit":None},"dimensions":dimensions}
- temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2)+"\n",encoding="utf-8");os.replace(temp,output)
+ manifest={"evidence_schema":"sage-prior-training-evidence-v2","algorithm_signature":ALGORITHM_SIGNATURE,"algorithm_contract":ALGORITHM_CONTRACT,"source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"provenance":provenance or {"training_commit":None,"consumer_commit":None},"dimensions":dimensions}
+ temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False)+"\n",encoding="utf-8");os.replace(temp,output)
  LOGGER.info(f"📋 training evidence: {output} | {output.stat().st_size} bytes | sha256={_sha256(output)} | algorithm={ALGORITHM_SIGNATURE}")
  return manifest
+
+def save_prediction_parity(output,tables,models,metadata):
+ output=Path(output).resolve();output.parent.mkdir(parents=True,exist_ok=True)
+ candidates=tables["connect"].loc[tables["connect"].partition.eq("final_test")]
+ if candidates.empty:raise ValueError("prediction parity 缺少 final_test feature vector")
+ features=[float(candidates.iloc[0][name]) for name in FEATURE_ORDER];sample=pd.DataFrame([features],columns=FEATURE_ORDER);predictions={}
+ for name in DIMENSIONS:
+  raw=float(np.asarray(models[name].predict(sample,num_iteration=models[name].best_iteration,raw_score=name=="failure"),float)[0]);value=float(metadata[name]["calibration_scale"])*raw+float(metadata[name]["calibration_bias"])
+  if metadata[name]["output_transform"]=="sigmoid":value=1/(1+math.exp(-max(-40.,min(40.,value))))
+  predictions[name]=value
+ payload={"schema":"sage-prior-prediction-parity-v1","feature_order":FEATURE_ORDER,"features":features,"predictions":predictions}
+ temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(payload,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False)+"\n",encoding="utf-8");os.replace(temp,output)
+ LOGGER.info(f"🔁 prediction parity: {output} | sha256={_sha256(output)}")
+ return payload
 
 def _validated_commit(value,name):
  value=str(value or "").strip()
@@ -339,14 +395,16 @@ def _validated_commit(value,name):
  return value.lower() or None
 
 def run_training(argv=None):
- p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"sage-data");p.add_argument("--output",type=Path,default=Path(__file__).parent/"SagePrior.json");p.add_argument("--evidence-output",type=Path);p.add_argument("--log-file",type=Path,default=DEFAULT_LOG_PATH);p.add_argument("--training-commit",default=os.environ.get("GITHUB_SHA",""));p.add_argument("--consumer-commit",default=os.environ.get("SAGE_CONSUMER_SHA",""));a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"sage-data-v2");p.add_argument("--output",type=Path,default=Path(__file__).parent/"SagePrior.json");p.add_argument("--evidence-output",type=Path);p.add_argument("--parity-output",type=Path);p.add_argument("--log-file",type=Path,default=DEFAULT_LOG_PATH);p.add_argument("--training-commit",default=os.environ.get("GITHUB_SHA",""));p.add_argument("--consumer-commit",default=os.environ.get("SAGE_CONSUMER_SHA",""));a=p.parse_args(argv)
  log_path=setup_logging(a.log_file);started=time.monotonic();_separator("Sage 原生四维先验训练")
  LOGGER.info(f"📋 source_schema={SOURCE_SCHEMA} | feature_schema={FEATURE_SCHEMA} | features={len(FEATURE_ORDER)} | algorithm={ALGORITHM_SIGNATURE}")
  try:
   provenance={"training_commit":_validated_commit(a.training_commit,"training_commit"),"consumer_commit":_validated_commit(a.consumer_commit,"consumer_commit")}
   events=load_native_events(a.data_dir);attempts,tables=build_training_tables(events);preflight=preflight_training_tables(tables);models={};metadata={}
   for name in DIMENSIONS:models[name],metadata[name]=train_dimension(name,tables[name],preflight[name])
-  manifest=save_bundle(a.output,attempts,models,metadata);evidence_output=a.evidence_output or Path(a.output).with_name(f"{Path(a.output).stem}.evidence.json");save_training_evidence(evidence_output,attempts,metadata,provenance);elapsed=time.monotonic()-started
+  manifest=save_bundle(a.output,attempts,models,metadata);evidence_output=a.evidence_output or Path(a.output).with_name(f"{Path(a.output).stem}.evidence.json");save_training_evidence(evidence_output,attempts,metadata,provenance)
+  if a.parity_output:save_prediction_parity(a.parity_output,tables,models,metadata)
+  elapsed=time.monotonic()-started
   _separator("训练完成")
   LOGGER.info(f"🎉 Sage 四维先验已生成: {Path(a.output).resolve()} | elapsed={elapsed:.2f}s")
   return manifest

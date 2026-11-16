@@ -12,7 +12,7 @@ class SageWorkflowNotifyTests(unittest.TestCase):
             "status": "success",
             "failed_step": "",
             "run_url": "https://github.com/example/actions/runs/1",
-            "release_tag": "sage-prior-model-1",
+            "release_tag": "sage-prior-v2-model-1",
             "training_commit": "1" * 40,
             "consumer_commit": "2" * 40,
             "bundle_sha": "3" * 64,

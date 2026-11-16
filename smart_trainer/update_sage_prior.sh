@@ -1,10 +1,10 @@
 #!/bin/sh
 # =============================================================================
-# update_sage_prior.sh — Sage 分维度先验模型更新（v1，2026-11-15）
+# update_sage_prior.sh — Sage P1 分维度先验模型更新
 #
-# 从 GitHub Releases 拉取最新的 sage-prior-model-* 发布：
-#   SagePrior-v1.zip（内含 SagePrior.json + 四个维度 .lgb）+ sha256
-# 校验通过后原子换装到 /etc/nikki/run/sage-prior/，仅当内容变化时重启。
+# 从 GitHub Releases 拉取最新的 sage-prior-v2-model-* 发布：
+#   SagePrior-v2.zip（内含 SagePrior.json + 四个维度 .lgb）+ sha256
+# 校验通过后原子换装到 /etc/nikki/run/sage-prior-v2/，仅当内容变化时重启。
 #
 # 与 update_model.sh（旧 PriorModel.bin）的关系：sage 内核不读
 # PriorModel.bin，旧脚本由本脚本取代（旧文件保留未删）。
@@ -13,10 +13,10 @@
 set -e
 
 REPO=yingxiaomo/mihomo-rules
-TAG_PREFIX=sage-prior-model-
-DST=/etc/nikki/run/sage-prior
+TAG_PREFIX=sage-prior-v2-model-
+DST=/etc/nikki/run/sage-prior-v2
 MARKER=$DST/.release_tag
-TMP=/tmp/sage-prior.new
+TMP=/tmp/sage-prior-v2.new
 PROXY="http://127.0.0.1:7890"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
@@ -34,19 +34,19 @@ send_telegram() {
   unset https_proxy http_proxy
 }
 
-# 1. 找最新的 sage-prior-model-* 发布
+# 1. 找最新的 sage-prior-v2-model-* 发布
 LATEST=$(curl -s --proxy "$PROXY" --max-time 20 \
   "https://api.github.com/repos/${REPO}/releases?per_page=30" | python3 -c '
 import json, sys
 rels = json.load(sys.stdin)
 for r in rels:
-    if str(r.get("tag_name", "")).startswith("sage-prior-model-"):
+    if str(r.get("tag_name", "")).startswith("sage-prior-v2-model-"):
         print(r["tag_name"])
         break
 ' 2>/dev/null) || LATEST=""
 
 if [ -z "$LATEST" ]; then
-  echo "[upsage-prior] 无 sage-prior-model-* 发布，跳过"
+  echo "[upsage-prior] 无 sage-prior-v2-model-* 发布，跳过"
   exit 0
 fi
 
@@ -62,17 +62,17 @@ rm -rf "$TMP"
 mkdir -p "$TMP"
 cd "$TMP"
 curl -sL --proxy "$PROXY" --max-time 180 \
-  -o SagePrior-v1.zip \
-  "https://github.com/${REPO}/releases/download/${LATEST}/SagePrior-v1.zip"
+  -o SagePrior-v2.zip \
+  "https://github.com/${REPO}/releases/download/${LATEST}/SagePrior-v2.zip"
 curl -sL --proxy "$PROXY" --max-time 30 \
-  -o SagePrior-v1.zip.sha256 \
-  "https://github.com/${REPO}/releases/download/${LATEST}/SagePrior-v1.zip.sha256"
-sha256sum -c SagePrior-v1.zip.sha256 >/dev/null 2>&1 || {
+  -o SagePrior-v2.zip.sha256 \
+  "https://github.com/${REPO}/releases/download/${LATEST}/SagePrior-v2.zip.sha256"
+sha256sum -c SagePrior-v2.zip.sha256 >/dev/null 2>&1 || {
   echo "[upsage-prior] sha256 校验失败，保留现有模型"
   exit 1
 }
-unzip -o -q SagePrior-v1.zip
-python3 -c "import json; d = json.load(open('SagePrior.json')); assert d.get('dimensions'), 'manifest invalid'"
+unzip -o -q SagePrior-v2.zip
+python3 -c "import json; d = json.load(open('SagePrior.json')); assert d.get('schema_version') == 3 and d.get('dimensions'), 'manifest invalid'"
 
 # 4. 原子换装
 rm -rf "${DST}.old"

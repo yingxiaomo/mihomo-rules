@@ -1,14 +1,14 @@
 # =============================================================================
-# upsage.sh — Sage 原生事件周更上传 + 本地轮换 + Telegram 战报（v1，2026-11-15）
+# upsage.sh — Sage P1 原生事件周更上传 + 本地轮换
 #
 # 只上传 Sage 内核 collect-events 产出的原生事件 JSONL。与训练合同对齐：
-#   train-sage-prior.yml 从 ${REMOTE}/sage-native 只取
-#   *.jsonl.ready / *.jsonl.failed / *.jsonl.recovered（.open 活跃文件不取）。
+#   train-sage-prior.yml 从 ${REMOTE}/sage-native-v2 只取
+#   sage-native-v2.* 的 ready/failed/recovered（.open 活跃文件不取）。
 #   文件名含 epoch+序号，天然唯一，无需改名。
 #
 # 流程：
 #   1. 归集 g-*/ 下的已关闭事件文件（含上次遗留）到本地归档目录；
-#   2. rclone copy 上传到 gdrive:smart_data/sage-native；
+#   2. rclone copy 上传到 gdrive:smart_data/sage-native-v2；
 #   3. 远端校验通过后本地轮换：删除归档目录中已上传文件。
 #      .open 活跃文件不动，收集器按 64MB/1h 继续轮转出新的 .ready。
 #
@@ -20,11 +20,11 @@
 # =============================================================================
 set -e
 
-SRC_BASE=/etc/nikki/run/sage-events
-ARCHIVE=/root/smart/sage-archive
+SRC_BASE=/etc/nikki/run/sage-events-v2
+ARCHIVE=/root/smart/sage-archive-v2
 REMOTE=rclone
 RCONF=/root/.config/rclone/rclone.conf
-GDRIVE_DIR=gdrive:smart_data/sage-native
+GDRIVE_DIR=gdrive:smart_data/sage-native-v2
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 TG_PROXY="http://127.0.0.1:7890"
@@ -47,8 +47,8 @@ mkdir -p "$ARCHIVE" "$SRC_BASE"
 
 # 1. 归集：g-*/ 下的已关闭事件文件 → ARCHIVE（扁平化，名字含 epoch+序号唯一）
 MOVED=0
-for f in "$SRC_BASE"/*/*.jsonl.ready "$SRC_BASE"/*/*.jsonl.failed "$SRC_BASE"/*/*.jsonl.recovered \
-         "$ARCHIVE"/*.jsonl.ready "$ARCHIVE"/*.jsonl.failed "$ARCHIVE"/*.jsonl.recovered; do
+for f in "$SRC_BASE"/*/sage-native-v2.*.jsonl.ready "$SRC_BASE"/*/sage-native-v2.*.jsonl.failed "$SRC_BASE"/*/sage-native-v2.*.jsonl.recovered \
+         "$ARCHIVE"/sage-native-v2.*.jsonl.ready "$ARCHIVE"/sage-native-v2.*.jsonl.failed "$ARCHIVE"/sage-native-v2.*.jsonl.recovered; do
   [ -f "$f" ] || continue
   base=$(basename "$f")
   [ -f "$ARCHIVE/$base" ] && continue
@@ -63,7 +63,7 @@ if [ "$MOVED" -eq 0 ] && [ -z "$(ls "$ARCHIVE" 2>/dev/null)" ]; then
 fi
 
 # 3. 上传 ARCHIVE 全部内容（含上次失败遗留，幂等覆盖）
-BYTES=$(cat "$ARCHIVE"/*.jsonl.ready "$ARCHIVE"/*.jsonl.failed "$ARCHIVE"/*.jsonl.recovered 2>/dev/null | wc -c)
+BYTES=$(cat "$ARCHIVE"/sage-native-v2.*.jsonl.ready "$ARCHIVE"/sage-native-v2.*.jsonl.failed "$ARCHIVE"/sage-native-v2.*.jsonl.recovered 2>/dev/null | wc -c)
 FILES=$(ls "$ARCHIVE" | wc -l)
 echo "[upsage] 上传 $FILES 个文件 / $BYTES 字节 → $GDRIVE_DIR"
 rclone copy "$ARCHIVE" "$GDRIVE_DIR" --config "$RCONF" --transfers=4 --checkers=8 --log-level=INFO
@@ -87,11 +87,11 @@ if [ "$MISS" -gt 0 ]; then
 fi
 
 # 5. 校验通过 → 本地轮换：清空归档目录（文件已安全在远端）
-rm -f "$ARCHIVE"/*.jsonl.ready "$ARCHIVE"/*.jsonl.failed "$ARCHIVE"/*.jsonl.recovered 2>/dev/null || true
+rm -f "$ARCHIVE"/sage-native-v2.*.jsonl.ready "$ARCHIVE"/sage-native-v2.*.jsonl.failed "$ARCHIVE"/sage-native-v2.*.jsonl.recovered 2>/dev/null || true
 
 MSG="🛰️ <b>[upsage] Sage 原生事件周更完成</b>
 📦 本轮归档: <b>$FILES 个事件文件</b>（$((BYTES/1024/1024)) MB，远端校验一致）
-☁️ 网盘路径: sage-native
+☁️ 网盘路径: sage-native-v2
 🔄 已关闭事件文件本地轮换，活跃 .open 不动"
 echo "[upsage] 完成: $FILES 个文件 / $BYTES 字节已上传并校验"
 send_telegram "$MSG"
