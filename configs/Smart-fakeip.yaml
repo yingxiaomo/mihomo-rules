@@ -3,7 +3,7 @@
 # 仅自用，要用的可以根据自己需求修改一下。
 
 
-# 本模板保留增强内核的 smart + uselightgbm / collectdata，未迁移为 smart-pld；MetaCubeX 官方内核不支持此 Smart 组。
+# 本模板保留增强内核（vernesong Smart）的 smart + uselightgbm / collectdata 组；MetaCubeX 官方内核不支持此 Smart 组。
 
 # 连通性检查通用锚点
 Check: &Check { url: "https://www.gstatic.com/generate_204", interval: 180, timeout: 5000, expected-status: 204 }
