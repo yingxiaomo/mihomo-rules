@@ -1,0 +1,11 @@
+{
+  "algorithm_signature": "ecc5aa098edcc9d02b73cf16efe63b5ef9079caaf9bbd08b5daeccd7082a29f5",
+  "evidence_sha256": "21ce5ad25eba767e3c3ff9c8a9f2c592a7274a07a0efd250124f96ed4776b8a8",
+  "manifest_sha256": "a75d1026faf0b186893f590515fd36b8b425644d20cc4c79595b3e68e3a85819",
+  "model_sha256": {
+    "connect": "ade53252789c959877e2c51f284eb39a5e280d46fe4c44cd0b2d061424c37422",
+    "failure": "a21e827b857511aa94d24e15d347f1124af68f7fd7545cd2460b0e68af2b74ae",
+    "response": "dc89f377bef8d5833d13b4983f32328d14ce2c422cb57faab7b02c3f2d18481d",
+    "throughput": "2d2fe9d6a096d23a5a6f35c9f4d848ed41d30979e597e5e254e9dd5a3d61ca64"
+  }
+}

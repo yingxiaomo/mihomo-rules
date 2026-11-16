@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Train four priors from Sage native events; PLD is never accepted."""
 from __future__ import annotations
-import argparse, hashlib, html, json, logging, os, shutil, sys, tempfile, time, traceback
+import argparse, bisect, hashlib, json, logging, os, shutil, sys, tempfile, time, traceback
 from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import requests
 from sklearn.linear_model import LogisticRegression
 
 SCHEMA_VERSION=2; SOURCE_SCHEMA="sage-native-events-v1"; FEATURE_SCHEMA="sage-prior-native-features-v1"
 MAX_PRIOR_CONFIDENCE=.35; MIN_TRAIN_ROWS=20; MIN_VALID_ROWS=5; MIN_CONFIDENCE_ROWS=20
 FEATURE_ORDER=["is_udp","is_tcp","port_log","asn_hash","host_hash","ip_hash","group_hash","node_type"]
 DIMENSIONS=("connect","response","throughput","failure"); PARTITIONS=("train","early_stop","calibration","final_test")
+FAILURE_MIN_CLASS_ATTEMPTS={"train":8,"early_stop":8,"calibration":3,"final_test":3}
 MODEL_PARAMS={"verbosity":-1,"learning_rate":.035,"num_leaves":24,"min_data_in_leaf":12,"feature_fraction":.9,"bagging_fraction":.9,"bagging_freq":1,"lambda_l1":.1,"lambda_l2":.5,"seed":20261115,"feature_fraction_seed":20261115,"bagging_seed":20261115,"data_random_seed":20261115,"deterministic":True,"force_col_wise":True,"num_threads":1}
+ALGORITHM_CONTRACT={"name":"sage-prior-training-v2","source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"feature_order":FEATURE_ORDER,"dimensions":DIMENSIONS,"partitions":PARTITIONS,"partition_ratios":[.60,.15,.10,.15],"minimum_partition_attempts":{"train":MIN_TRAIN_ROWS,"early_stop":MIN_VALID_ROWS,"calibration":MIN_VALID_ROWS,"final_test":MIN_VALID_ROWS},"partition_ties":"same decision_unix_nano group is never split; choose nearest feasible group-safe cuts","attempt_context":"exactly one decision event; label decision_unix_nano, transport and features must match; observed_unix_nano >= decision_unix_nano","failure_min_positive_attempts":FAILURE_MIN_CLASS_ATTEMPTS,"late_label_rule":"observed_unix_nano < next_partition_decision_unix_nano; no refill","throughput_weight":"sum per attempt = 1","baselines":{"regression":"train weighted median","failure":"train weighted failure prevalence"},"failure_calibration":"logistic regression on calibration raw score when calibration positives >= 3 and both classes exist","confidence":"min(0.35,max(0,1-model_error/baseline_error)); failure class gate and final_test>=20","model_params":MODEL_PARAMS}
+ALGORITHM_SIGNATURE=hashlib.sha256(json.dumps(ALGORITHM_CONTRACT,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode()).hexdigest()
 
 LOGGER = logging.getLogger("sage_prior_trainer")
 DEFAULT_LOG_PATH = Path(__file__).with_name("training_sage.log")
-MAX_TG_CHUNKS = 12
 
 def setup_logging(path=DEFAULT_LOG_PATH):
  path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
@@ -43,42 +44,6 @@ def _close_logging():
 
 def _separator(title):
  LOGGER.info("="*72);LOGGER.info(title);LOGGER.info("="*72)
-
-def _send_telegram(text):
- token=os.environ.get("TG_BOT_TOKEN","");chat_id=os.environ.get("TG_CHAT_ID","")
- if not token or not chat_id:return False
- for attempt in range(1,4):
-  try:
-   response=requests.post(f"https://api.telegram.org/bot{token}/sendMessage",json={"chat_id":chat_id,"text":text,"parse_mode":"HTML"},timeout=10)
-   if response.status_code==200:
-    try:api_ok=response.json().get("ok") is True
-    except (requests.JSONDecodeError,ValueError,AttributeError):api_ok=False
-    if api_ok:return True
-    LOGGER.warning(f"⚠️ Telegram 发送失败: HTTP 200 但 Bot API ok!=true (attempt {attempt}/3)")
-   delay=attempt
-   if response.status_code==429:
-    try:delay=max(1,min(10,int(response.json().get("parameters",{}).get("retry_after",attempt))))
-    except (TypeError,ValueError,AttributeError):delay=attempt
-   if response.status_code!=200:LOGGER.warning(f"⚠️ Telegram 发送失败: HTTP {response.status_code} (attempt {attempt}/3)")
-  except Exception as exc:
-   delay=attempt;LOGGER.warning(f"⚠️ Telegram 发送失败: {type(exc).__name__} (attempt {attempt}/3)")
-  if attempt<3:time.sleep(delay)
- return False
-
-def send_telegram_logs(header,log_path):
- if not os.environ.get("TG_BOT_TOKEN") or not os.environ.get("TG_CHAT_ID"):
-  LOGGER.info("ℹ️ Telegram 未配置，已跳过训练日志推送");return
- messages=[header]
- try:content=Path(log_path).read_text(encoding="utf-8")
- except Exception as exc:LOGGER.warning(f"⚠️ 无法读取训练日志: {exc}");return
- chunks=[content[i:i+3500] for i in range(0,len(content),3500)]
- messages.extend(f"<pre>{html.escape(chunk)}</pre>" for chunk in chunks[:MAX_TG_CHUNKS])
- sent=0
- for index,message in enumerate(messages):
-  sent+=int(_send_telegram(message))
-  if index<len(messages)-1:time.sleep(.5)
- if sent==len(messages):LOGGER.info(f"📨 Telegram 日志推送完成: {sent}/{len(messages)} 条（日志 {min(len(chunks),MAX_TG_CHUNKS)}/{len(chunks)} 块）")
- else:LOGGER.warning(f"⚠️ Telegram 日志推送不完整: {sent}/{len(messages)} 条成功（日志 {min(len(chunks),MAX_TG_CHUNKS)}/{len(chunks)} 块）")
 
 def _format_ns(value):
  if value is None:return "结束"
@@ -153,46 +118,135 @@ def build_features(events):
   rows.append(a)
  return pd.DataFrame(rows,columns=FEATURE_ORDER,index=events.index)
 
+def _global_attempts(events):
+ return events.groupby("attempt_id",as_index=False).agg(decision_unix_nano=("decision_unix_nano","min")).sort_values(["decision_unix_nano","attempt_id"],kind="stable").reset_index(drop=True)
+
+def _nearest_position(positions,target,lower,upper):
+ left=bisect.bisect_left(positions,lower);right=bisect.bisect_right(positions,upper)
+ if left>=right:return None
+ pivot=bisect.bisect_left(positions,target,left,right);candidates=[]
+ if pivot<right:candidates.append(positions[pivot])
+ if pivot>left:candidates.append(positions[pivot-1])
+ return min(candidates,key=lambda value:(abs(value-target),value))
+
+def _group_safe_cuts(attempts):
+ count=len(attempts)
+ if count<=0:return [0,0,0,0,count]
+ group_ends=attempts.groupby("decision_unix_nano",sort=False).size().cumsum().astype(int).tolist();boundaries=group_ends[:-1];targets=[int(count*.60),int(count*.75),int(count*.85)]
+ if count>=MIN_TRAIN_ROWS+3*MIN_VALID_ROWS:
+  b2_options=[]
+  for b2 in boundaries:
+   b3=_nearest_position(boundaries,targets[2],b2+MIN_VALID_ROWS,count-MIN_VALID_ROWS)
+   if b3 is not None:b2_options.append((b2,b3,abs(b2-targets[1])+abs(b3-targets[2])))
+  suffix=[None]*len(b2_options);best=None
+  for index in range(len(b2_options)-1,-1,-1):
+   candidate=b2_options[index];best=min((candidate,best) if best is not None else (candidate,),key=lambda item:(item[2],item[0],item[1]));suffix[index]=best
+  b2_values=[item[0] for item in b2_options];chosen=None
+  for b1 in boundaries:
+   if b1<MIN_TRAIN_ROWS:continue
+   index=bisect.bisect_left(b2_values,b1+MIN_VALID_ROWS)
+   if index>=len(suffix):continue
+   b2,b3,cost=suffix[index];candidate=(abs(b1-targets[0])+cost,b1,b2,b3)
+   if chosen is None or candidate<chosen:chosen=candidate
+  if chosen is not None:return [0,chosen[1],chosen[2],chosen[3],count]
+ cuts=[0]
+ for target in targets:
+  value=_nearest_position(group_ends,target,cuts[-1],count)
+  cuts.append(count if value is None else value)
+ cuts.append(count);return cuts
+
 def _attempt_partitions(events):
- attempts=events.groupby("attempt_id",as_index=False).agg(decision_unix_nano=("decision_unix_nano","min")).sort_values(["decision_unix_nano","attempt_id"],kind="stable").reset_index(drop=True)
- minimum=MIN_TRAIN_ROWS+3*MIN_VALID_ROWS
- if len(attempts)<minimum: raise ValueError(f"独立 attempt 至少需要 {minimum} 条")
- a=max(MIN_TRAIN_ROWS,int(len(attempts)*.60)); b=max(a+MIN_VALID_ROWS,int(len(attempts)*.75)); c=max(b+MIN_VALID_ROWS,int(len(attempts)*.85)); c=min(c,len(attempts)-MIN_VALID_ROWS)
- if b>=c:b=c-MIN_VALID_ROWS
- cuts=(0,a,b,c,len(attempts)); attempts["partition"]=""
- for name,left,right in zip(PARTITIONS,cuts[:-1],cuts[1:]): attempts.loc[left:right-1,"partition"]=name
- bounds={name:(int(attempts.iloc[cuts[i+1]].decision_unix_nano) if cuts[i+1]<len(attempts) else None) for i,name in enumerate(PARTITIONS)}
- return attempts,bounds
+ attempts=_global_attempts(events);cuts=_group_safe_cuts(attempts);attempts["partition"]=""
+ boundaries={}
+ for name,left,right in zip(PARTITIONS,cuts[:-1],cuts[1:]):
+  attempts.loc[left:right-1,"partition"]=name
+  start=int(attempts.iloc[left].decision_unix_nano) if left<right else None
+  upper=int(attempts.iloc[right].decision_unix_nano) if right<len(attempts) else None
+  boundaries[name]={"start_inclusive_decision_unix_nano":start,"end_exclusive_decision_unix_nano":upper,"observed_before_unix_nano":upper}
+ return attempts,boundaries
+
+def _validated_attempt_context(events):
+ decisions=events.loc[events.event_type.eq("decision")].copy();counts=decisions.groupby("attempt_id").size();all_attempts=set(events.attempt_id.astype(str));missing=sorted(all_attempts-set(counts.index.astype(str)));duplicates=sorted(counts.loc[counts.ne(1)].index.astype(str))
+ if missing or duplicates:raise ValueError(f"attempt decision 事件必须恰好一条: missing={missing[:5]} duplicates={duplicates[:5]}")
+ canonical=decisions.set_index("attempt_id");work=events.copy();decision_map=work.attempt_id.map(canonical.decision_unix_nano);transport_map=work.attempt_id.map(canonical.transport);feature_map=work.attempt_id.map(canonical.features)
+ bad_time=work.decision_unix_nano.ne(decision_map);bad_transport=work.transport.ne(transport_map);bad_features=pd.Series([_canonical(left)!=_canonical(right) for left,right in zip(work.features,feature_map)],index=work.index);bad_observed=work.observed_unix_nano.lt(decision_map)
+ if bad_time.any():raise ValueError(f"attempt 标签 decision_unix_nano 与 decision 事件不一致: {work.loc[bad_time,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ if bad_transport.any():raise ValueError(f"attempt 标签 transport 与 decision 事件不一致: {work.loc[bad_transport,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ if bad_features.any():raise ValueError(f"attempt 标签 features 与 decision 事件不一致: {work.loc[bad_features,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ if bad_observed.any():raise ValueError(f"事件 observed_unix_nano 早于 decision: {work.loc[bad_observed,'attempt_id'].astype(str).drop_duplicates().tolist()[:5]}")
+ work["decision_unix_nano"]=decision_map.astype(np.int64);work["transport"]=transport_map;work["features"]=feature_map
+ return work
+
+def _failure_class_gate(table):
+ counts={}
+ deficits=[]
+ for part in PARTITIONS:
+  frame=table.loc[table.partition.eq(part),["attempt_id","label"]].drop_duplicates()
+  success=int(frame.loc[frame.label.eq(0),"attempt_id"].nunique());failure=int(frame.loc[frame.label.eq(1),"attempt_id"].nunique());required=FAILURE_MIN_CLASS_ATTEMPTS[part]
+  counts[part]={"success":success,"failure":failure}
+  if failure<required:deficits.append({"partition":part,"class":"failure","actual":failure,"required":required,"missing":required-failure})
+ return {"passed":not deficits,"minimums":dict(FAILURE_MIN_CLASS_ATTEMPTS),"counts":counts,"deficits":deficits}
+
+def _dimension_preflight(name,table):
+ counts={part:int(table.loc[table.partition.eq(part),"attempt_id"].nunique()) for part in PARTITIONS}
+ result={"partition_attempts":counts,"partition_boundaries":table.attrs.get("partition_boundaries",{}),"candidate_rows":int(table.attrs.get("candidate_rows",len(table))),"invalid_rows":int(table.attrs.get("invalid_rows",0)),"late_dropped_rows":int(table.attrs.get("late_dropped_rows",0)),"retained_rows":int(len(table))}
+ if name=="failure":result["class_gate"]=_failure_class_gate(table)
+ return result
+
+def preflight_training_tables(tables):
+ _separator("[步骤3] 四维训练前统一预检")
+ report={};blocking=[]
+ for name in DIMENSIONS:
+  if name not in tables:
+   blocking.append(f"{name}: 缺少训练表");continue
+  evidence=_dimension_preflight(name,tables[name]);report[name]=evidence;counts=evidence["partition_attempts"]
+  LOGGER.info(f"🔎 {name:<10} "+" | ".join(f"{part}={counts[part]}" for part in PARTITIONS))
+  missing=[]
+  if counts["train"]<MIN_TRAIN_ROWS:missing.append(f"train 缺 {MIN_TRAIN_ROWS-counts['train']}")
+  for part in PARTITIONS[1:]:
+   if counts[part]<MIN_VALID_ROWS:missing.append(f"{part} 缺 {MIN_VALID_ROWS-counts[part]}")
+  if missing:blocking.append(f"{name}: "+", ".join(missing))
+  if name=="failure":
+   gate=evidence["class_gate"]
+   LOGGER.info("🧪 failure 类别: "+" | ".join(f"{part}=success:{gate['counts'][part]['success']},failure:{gate['counts'][part]['failure']},required_failure:{gate['minimums'][part]}" for part in PARTITIONS))
+   if gate["deficits"]:LOGGER.warning("⚠️ failure 类别门禁不足，confidence 将强制为 0: "+json.dumps(gate["deficits"],ensure_ascii=False,separators=(",",":")))
+ if blocking:raise ValueError("四维训练预检失败: "+"; ".join(blocking))
+ LOGGER.info("✅ 四维总量预检通过，开始训练")
+ return report
 
 def build_training_tables(events):
- LOGGER.info("[步骤2] 按 attempt 做全局时间切分并构造四维标签")
+ LOGGER.info("[步骤2] 按各维有效标签 attempt 独立时间切分并构造四维标签")
  required={"attempt_id","event_type","decision_unix_nano","observed_unix_nano","transport","features"}
  if required-set(events.columns): raise ValueError(f"缺少字段 {sorted(required-set(events.columns))}")
- attempts,bounds=_attempt_partitions(events); work=events.copy(); work["partition"]=work.attempt_id.map(attempts.set_index("attempt_id").partition); features=build_features(work)
- partition_counts=attempts.partition.value_counts()
- LOGGER.info(f"🧩 独立 attempt: {len(attempts)} | "+" | ".join(f"{name}={int(partition_counts.get(name,0))}" for name in PARTITIONS))
- LOGGER.info("🕒 attempt 分区依据=decision_unix_nano；分区上界: "+" | ".join(f"{name}<{_format_ns(bounds[name])}" for name in PARTITIONS))
- LOGGER.info("🧹 标签迟到过滤依据=observed_unix_nano；标签必须早于所属分区上界")
+ work=_validated_attempt_context(events);attempts=_global_attempts(work);features=build_features(work)
+ LOGGER.info(f"🧩 全局独立 attempt: {len(attempts)}")
+ LOGGER.info("🧹 各维边界依据=有效标签 attempt 的 decision_unix_nano；迟到过滤严格要求 observed_unix_nano < 下一分区边界；过滤后不补位")
  for name in FEATURE_ORDER: work[name]=features[name]
  empty=pd.Series(index=work.index,dtype=object)
  specs={"connect":(work.event_type.eq("setup")&work.get("setup_status",empty).eq("returned"),"log_milliseconds"),"response":(work.event_type.eq("response")&work.transport.eq("tcp"),"log_milliseconds"),"throughput":(work.event_type.eq("throughput")&work.transport.eq("tcp"),"log_bits_per_second"),"failure":(work.event_type.eq("outcome")&work.get("outcome",empty).isin(["success","failure"]),"probability")}
  tables={}
  for name,(mask,unit) in specs.items():
-  table=work.loc[mask].copy()
-  if table.empty: raise ValueError(f"{name} 没有有效标签")
-  candidates=len(table)
-  value=pd.to_numeric(table.value,errors="coerce")
+  table=work.loc[mask].copy();candidates=len(table);value=pd.to_numeric(table.get("value"),errors="coerce")
   if name in ("connect","response"): valid=value.gt(0)&value.le(30000); table["label"]=np.log(value.clip(1,30000))
-  elif name=="throughput": valid=value.ge(8192)&value.le(1e9)&pd.to_numeric(table.bytes,errors="coerce").ge(65536)&pd.to_numeric(table.elapsed_nano,errors="coerce").ge(2e9); table["label"]=np.log(value.clip(8192,1e9))
-  else: valid=table.outcome.isin(["success","failure"]); table["label"]=table.outcome.map({"success":0.,"failure":1.})
-  table=table.loc[valid&table[FEATURE_ORDER].notna().all(axis=1)].copy();invalid_dropped=candidates-len(table);before_late=len(table);keep=pd.Series(True,index=table.index)
-  for part,upper in bounds.items():
-   if upper is not None: keep &= ~table.partition.eq(part)|table.observed_unix_nano.lt(upper)
+  elif name=="throughput": valid=value.ge(8192)&value.le(1e9)&pd.to_numeric(table.get("bytes"),errors="coerce").ge(65536)&pd.to_numeric(table.get("elapsed_nano"),errors="coerce").ge(2e9); table["label"]=np.log(value.clip(8192,1e9))
+  else: valid=table.get("outcome",empty).isin(["success","failure"]); table["label"]=table.get("outcome",empty).map({"success":0.,"failure":1.})
+  table=table.loc[valid&table[FEATURE_ORDER].notna().all(axis=1)].copy();invalid_dropped=candidates-len(table)
+  if name=="failure":
+   conflicts=table.groupby("attempt_id").label.nunique();conflicts=conflicts.loc[conflicts.gt(1)]
+   if len(conflicts):raise ValueError(f"failure attempt 终态冲突: {conflicts.index.tolist()[:5]}")
+  label_attempts,boundaries=_attempt_partitions(table);table["partition"]=table.attempt_id.map(label_attempts.set_index("attempt_id").partition)
+  before_late=len(table);keep=pd.Series(True,index=table.index)
+  for part,boundary in boundaries.items():
+   upper=boundary["observed_before_unix_nano"]
+   if upper is not None:keep &= ~table.partition.eq(part)|table.observed_unix_nano.lt(upper)
   table=table.loc[keep].copy();late_dropped=before_late-len(table);table["weight"]=1.
-  if name=="throughput": table["weight"]=1./table.groupby("attempt_id").attempt_id.transform("count").clip(lower=1)
-  table["unit"]=unit; tables[name]=table.sort_values(["decision_unix_nano","attempt_id","event_seq"],kind="stable").reset_index(drop=True)
-  by_partition=tables[name].groupby("partition").attempt_id.nunique()
-  LOGGER.info(f"  • {name:<10} candidate={candidates} → invalid/range dropped={invalid_dropped} → late dropped={late_dropped} → retained={len(tables[name])} | 独立 attempt={tables[name].attempt_id.nunique()} | "+" | ".join(f"{part}={int(by_partition.get(part,0))}" for part in PARTITIONS))
+  if name=="throughput":table["weight"]=1./table.groupby("attempt_id").attempt_id.transform("count").clip(lower=1)
+  table["unit"]=unit;table=table.sort_values(["decision_unix_nano","attempt_id","event_seq"],kind="stable").reset_index(drop=True)
+  by_partition={part:int(table.loc[table.partition.eq(part),"attempt_id"].nunique()) for part in PARTITIONS}
+  table.attrs={"partition_boundaries":boundaries,"partition_attempts":by_partition,"candidate_rows":candidates,"invalid_rows":invalid_dropped,"late_dropped_rows":late_dropped}
+  tables[name]=table
+  LOGGER.info(f"  • {name:<10} candidate={candidates} → invalid/range dropped={invalid_dropped} → late dropped={late_dropped} → retained={len(table)} | 独立 attempt={table.attempt_id.nunique()} | "+" | ".join(f"{part}={by_partition[part]}" for part in PARTITIONS))
+  LOGGER.info("    分区上界: "+" | ".join(f"{part}<{_format_ns(boundaries[part]['end_exclusive_decision_unix_nano'])}" for part in PARTITIONS))
   if name=="throughput":LOGGER.info("    throughput 权重: 同一 attempt 内各窗口权重和固定为 1")
  return attempts,tables
 
@@ -206,44 +260,43 @@ def _weighted_median(v,w):
  v,w=v[valid],w[valid]; order=np.argsort(v,kind="stable");v,w=v[order],w[order]
  return float(v[min(int(np.searchsorted(np.cumsum(w),w.sum()*.5,side="left")),len(v)-1)])
 
-def train_dimension(name,table):
- _separator(f"[步骤3] 训练 {name} 维度")
- parts={p:table.loc[table.partition.eq(p)].reset_index(drop=True) for p in PARTITIONS}
- evidence={p:int(frame.attempt_id.nunique()) for p,frame in parts.items()}
- if evidence["train"]<MIN_TRAIN_ROWS or any(evidence[p]<MIN_VALID_ROWS for p in PARTITIONS[1:]):raise ValueError(f"{name} 独立 attempt 分区不足: {evidence}")
+def train_dimension(name,table,preflight=None):
+ _separator(f"[步骤4] 训练 {name} 维度")
+ evidence=preflight or _dimension_preflight(name,table);parts={p:table.loc[table.partition.eq(p)].reset_index(drop=True) for p in PARTITIONS};counts=evidence["partition_attempts"]
+ if counts["train"]<MIN_TRAIN_ROWS or any(counts[p]<MIN_VALID_ROWS for p in PARTITIONS[1:]):raise ValueError(f"{name} 独立 attempt 分区不足: {counts}")
  objective,metric=("binary","binary_logloss") if name=="failure" else ("regression_l2","l2");params={**MODEL_PARAMS,"objective":objective,"metric":metric};train,early=parts["train"],parts["early_stop"]
- LOGGER.info("📊 独立 attempt: "+" | ".join(f"{part}={evidence[part]}" for part in PARTITIONS))
+ LOGGER.info("📊 独立 attempt: "+" | ".join(f"{part}={counts[part]}" for part in PARTITIONS))
  LOGGER.info(f"🏷️ 标签: rows={len(table)} | min={table.label.min():.6f} | p50={table.label.median():.6f} | p95={table.label.quantile(.95):.6f} | max={table.label.max():.6f}")
  if name=="failure":LOGGER.info(f"⚖️ 失败标签: success={int((table.label==0).sum())} | failure={int((table.label==1).sum())}")
  LOGGER.info(f"🌲 LightGBM: objective={objective} | metric={metric} | max_rounds=600 | early_stopping=40 | learning_rate={params['learning_rate']} | features={len(FEATURE_ORDER)}")
- ds=lgb.Dataset(train[FEATURE_ORDER],label=train.label,weight=train.weight,feature_name=FEATURE_ORDER); es=lgb.Dataset(early[FEATURE_ORDER],label=early.label,weight=early.weight,reference=ds,feature_name=FEATURE_ORDER)
+ ds=lgb.Dataset(train[FEATURE_ORDER],label=train.label,weight=train.weight,feature_name=FEATURE_ORDER);es=lgb.Dataset(early[FEATURE_ORDER],label=early.label,weight=early.weight,reference=ds,feature_name=FEATURE_ORDER)
  model=lgb.train(params,ds,num_boost_round=600,valid_sets=[es],valid_names=["early_stop"],callbacks=[lgb.early_stopping(40,verbose=True),lgb.log_evaluation(50)])
  LOGGER.info(f"🏆 {name} 最佳迭代: {model.best_iteration}")
- final=parts["final_test"];truth,weights=final.label.to_numpy(float),final.weight.to_numpy(float);ty,tw=train.label.to_numpy(float),train.weight.to_numpy(float);transform,scale,bias="identity",1.,0.
+ final=parts["final_test"];truth,weights=final.label.to_numpy(float),final.weight.to_numpy(float);ty,tw=train.label.to_numpy(float),train.weight.to_numpy(float);transform,scale,bias="identity",1.,0.;class_gate=None
  if name=="failure":
-  transform="sigmoid";cal=parts["calibration"];cy,cw=cal.label.to_numpy(float),cal.weight.to_numpy(float);raw=np.asarray(model.predict(cal[FEATURE_ORDER],num_iteration=model.best_iteration,raw_score=True),float);calibrated=len(np.unique(cy))==2
-  if calibrated:
-   lr=LogisticRegression(C=1e6,solver="lbfgs",random_state=20261115).fit(raw.reshape(-1,1),cy,sample_weight=cw);candidate_scale,candidate_bias=float(lr.coef_[0,0]),float(lr.intercept_[0])
-   if candidate_scale>0:scale,bias=candidate_scale,candidate_bias
-   else:calibrated=False
-  raw=np.asarray(model.predict(final[FEATURE_ORDER],num_iteration=model.best_iteration,raw_score=True),float);pred=1/(1+np.exp(-np.clip(scale*raw+bias,-40,40)));base=float(np.average(ty,weights=tw));error=float(np.average((truth-pred)**2,weights=weights));base_error=float(np.average((truth-base)**2,weights=weights));metric_name="brier"
-  baseline_strategy="train weighted failure prevalence"
+  transform="sigmoid";class_gate=evidence.get("class_gate") or _failure_class_gate(table);cal=parts["calibration"];cy,cw=cal.label.to_numpy(float),cal.weight.to_numpy(float);raw=np.asarray(model.predict(cal[FEATURE_ORDER],num_iteration=model.best_iteration,raw_score=True),float);calibration_ready=len(np.unique(cy))==2 and class_gate["counts"]["calibration"]["failure"]>=FAILURE_MIN_CLASS_ATTEMPTS["calibration"]
+  if calibration_ready:
+   lr=LogisticRegression(C=1e6,solver="lbfgs",random_state=20261115).fit(raw.reshape(-1,1),cy,sample_weight=cw);candidate_scale,candidate_bias=float(lr.coef_[0,0]),float(lr.intercept_[0]);calibrated=candidate_scale>0
+   if calibrated:scale,bias=candidate_scale,candidate_bias
+  else:calibrated=False
+  raw=np.asarray(model.predict(final[FEATURE_ORDER],num_iteration=model.best_iteration,raw_score=True),float);pred=1/(1+np.exp(-np.clip(scale*raw+bias,-40,40)));base=float(np.average(ty,weights=tw));error=float(np.average((truth-pred)**2,weights=weights));base_error=float(np.average((truth-base)**2,weights=weights));metric_name="brier";baseline_strategy="train weighted failure prevalence"
  else:
-  calibrated=True;pred=np.asarray(model.predict(final[FEATURE_ORDER],num_iteration=model.best_iteration),float);base=_weighted_median(ty,tw);error=float(np.average(abs(truth-pred),weights=weights));base_error=float(np.average(abs(truth-base),weights=weights));metric_name="mae_log"
-  baseline_strategy="train weighted median"
- confidence=_confidence(error,base_error) if calibrated and evidence["final_test"]>=MIN_CONFIDENCE_ROWS else 0.
+  calibrated=True;pred=np.asarray(model.predict(final[FEATURE_ORDER],num_iteration=model.best_iteration),float);base=_weighted_median(ty,tw);error=float(np.average(abs(truth-pred),weights=weights));base_error=float(np.average(abs(truth-base),weights=weights));metric_name="mae_log";baseline_strategy="train weighted median"
+ class_gate_passed=name!="failure" or bool(class_gate["passed"]);confidence=_confidence(error,base_error) if calibrated and class_gate_passed and counts["final_test"]>=MIN_CONFIDENCE_ROWS else 0.
  improvement=(1-error/base_error) if np.isfinite(base_error) and base_error>1e-12 else float("nan")
  LOGGER.info(f"📏 朴素基线: strategy={baseline_strategy} | prediction={base:.9f}")
  LOGGER.info(f"🧪 最终验证: metric={metric_name} | model_error={error:.9f} | baseline_error={base_error:.9f} | improvement={improvement:.2%}")
- if not calibrated:reason="校准集类别不足或校准斜率无效"
- elif evidence["final_test"]<MIN_CONFIDENCE_ROWS:reason=f"final_test 独立 attempt {evidence['final_test']} < {MIN_CONFIDENCE_ROWS}"
+ if name=="failure" and not class_gate_passed:reason="failure 类别门禁不足: "+", ".join(f"{d['partition']} failure {d['actual']}/{d['required']} (缺 {d['missing']})" for d in class_gate["deficits"])
+ elif not calibrated:reason="校准集类别不足或校准斜率无效"
+ elif counts["final_test"]<MIN_CONFIDENCE_ROWS:reason=f"final_test 独立 attempt {counts['final_test']} < {MIN_CONFIDENCE_ROWS}"
  elif not np.isfinite(error):reason="model_error 非有限"
  elif not np.isfinite(base_error) or base_error<=1e-12:reason="baseline_error 非法或无区分度"
  elif improvement<=0:reason="模型未优于朴素基线"
  else:reason="通过"
  LOGGER.info(f"🛡️ confidence={confidence:.6f} / cap={MAX_PRIOR_CONFIDENCE:.2f} | gate={reason}")
- if name=="failure":LOGGER.info(f"🎛️ failure calibration: calibrated={calibrated} | scale={scale:.12f} | bias={bias:.12f}")
- return model,{"unit":str(table.unit.iloc[0]),"confidence":confidence,"train_samples":evidence["train"],"early_stop_samples":evidence["early_stop"],"calibration_samples":evidence["calibration"],"validation_samples":evidence["final_test"],"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9),"output_transform":transform,"calibration_scale":round(scale,12),"calibration_bias":round(bias,12)}
+ if name=="failure":LOGGER.info(f"🎛️ failure calibration: calibrated={calibrated} | class_gate={class_gate_passed} | scale={scale:.12f} | bias={bias:.12f}")
+ training_evidence={**evidence,"confidence_gate":reason,"confidence":confidence,"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9)}
+ return model,{"unit":str(table.unit.iloc[0]),"confidence":confidence,"train_samples":counts["train"],"early_stop_samples":counts["early_stop"],"calibration_samples":counts["calibration"],"validation_samples":counts["final_test"],"validation_metric":metric_name,"validation_error":round(error,9),"baseline_error":round(base_error,9),"output_transform":transform,"calibration_scale":round(scale,12),"calibration_bias":round(bias,12),"_evidence":training_evidence}
 
 def _sha256(path):
  h=hashlib.sha256()
@@ -252,14 +305,15 @@ def _sha256(path):
  return h.hexdigest()
 
 def save_bundle(output,attempts,models,metadata):
- _separator("[步骤4] 生成原子化四维模型包")
+ _separator("[步骤5] 生成原子化四维模型包")
  output=Path(output).resolve();output.parent.mkdir(parents=True,exist_ok=True);stem=output.stem;dimensions={};staging=Path(tempfile.mkdtemp(prefix=f".{stem}-",dir=output.parent));created=[]
  try:
   for name in DIMENSIONS:
    staged=staging/f"{stem}-{name}.lgb";models[name].save_model(str(staged),num_iteration=models[name].best_iteration);digest=_sha256(staged);target=output.with_name(f"{stem}-{name}-{digest[:16]}.lgb")
    if target.exists() and _sha256(target)!=digest:raise ValueError("模型冲突")
    if not target.exists():os.replace(staged,target);created.append(target)
-   dimensions[name]={**metadata[name],"model":target.name,"sha256":digest}
+   runtime_metadata={key:value for key,value in metadata[name].items() if not key.startswith("_")}
+   dimensions[name]={**runtime_metadata,"model":target.name,"sha256":digest}
    LOGGER.info(f"  ✓ {name:<10} {target.name} | {target.stat().st_size} bytes | sha256={digest}")
   manifest={"schema_version":SCHEMA_VERSION,"feature_schema":FEATURE_SCHEMA,"source_schema":SOURCE_SCHEMA,"feature_order":FEATURE_ORDER,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"max_prior_confidence":MAX_PRIOR_CONFIDENCE,"dimensions":dimensions}
   temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2)+"\n",encoding="utf-8");os.replace(temp,output)
@@ -271,21 +325,33 @@ def save_bundle(output,attempts,models,metadata):
   raise
  finally:shutil.rmtree(staging,ignore_errors=True)
 
+def save_training_evidence(output,attempts,metadata,provenance=None):
+ output=Path(output).resolve();output.parent.mkdir(parents=True,exist_ok=True)
+ dimensions={name:metadata[name]["_evidence"] for name in DIMENSIONS}
+ manifest={"evidence_schema":"sage-prior-training-evidence-v1","algorithm_signature":ALGORITHM_SIGNATURE,"algorithm_contract":ALGORITHM_CONTRACT,"source_schema":SOURCE_SCHEMA,"feature_schema":FEATURE_SCHEMA,"generated_from_event_unix":int(attempts.decision_unix_nano.max()//1_000_000_000),"provenance":provenance or {"training_commit":None,"consumer_commit":None},"dimensions":dimensions}
+ temp=output.with_suffix(output.suffix+".tmp");temp.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True,indent=2)+"\n",encoding="utf-8");os.replace(temp,output)
+ LOGGER.info(f"📋 training evidence: {output} | {output.stat().st_size} bytes | sha256={_sha256(output)} | algorithm={ALGORITHM_SIGNATURE}")
+ return manifest
+
+def _validated_commit(value,name):
+ value=str(value or "").strip()
+ if value and (len(value)!=40 or any(ch not in "0123456789abcdefABCDEF" for ch in value)):raise ValueError(f"{name} 必须是 40 位 commit SHA")
+ return value.lower() or None
+
 def run_training(argv=None):
- p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"sage-data");p.add_argument("--output",type=Path,default=Path(__file__).parent/"SagePrior.json");p.add_argument("--log-file",type=Path,default=DEFAULT_LOG_PATH);a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--data-dir",type=Path,default=Path(__file__).parent/"sage-data");p.add_argument("--output",type=Path,default=Path(__file__).parent/"SagePrior.json");p.add_argument("--evidence-output",type=Path);p.add_argument("--log-file",type=Path,default=DEFAULT_LOG_PATH);p.add_argument("--training-commit",default=os.environ.get("GITHUB_SHA",""));p.add_argument("--consumer-commit",default=os.environ.get("SAGE_CONSUMER_SHA",""));a=p.parse_args(argv)
  log_path=setup_logging(a.log_file);started=time.monotonic();_separator("Sage 原生四维先验训练")
- LOGGER.info(f"📋 source_schema={SOURCE_SCHEMA} | feature_schema={FEATURE_SCHEMA} | features={len(FEATURE_ORDER)}")
+ LOGGER.info(f"📋 source_schema={SOURCE_SCHEMA} | feature_schema={FEATURE_SCHEMA} | features={len(FEATURE_ORDER)} | algorithm={ALGORITHM_SIGNATURE}")
  try:
-  events=load_native_events(a.data_dir);attempts,tables=build_training_tables(events);models={};metadata={}
-  for name in DIMENSIONS:models[name],metadata[name]=train_dimension(name,tables[name])
-  manifest=save_bundle(a.output,attempts,models,metadata);elapsed=time.monotonic()-started
+  provenance={"training_commit":_validated_commit(a.training_commit,"training_commit"),"consumer_commit":_validated_commit(a.consumer_commit,"consumer_commit")}
+  events=load_native_events(a.data_dir);attempts,tables=build_training_tables(events);preflight=preflight_training_tables(tables);models={};metadata={}
+  for name in DIMENSIONS:models[name],metadata[name]=train_dimension(name,tables[name],preflight[name])
+  manifest=save_bundle(a.output,attempts,models,metadata);evidence_output=a.evidence_output or Path(a.output).with_name(f"{Path(a.output).stem}.evidence.json");save_training_evidence(evidence_output,attempts,metadata,provenance);elapsed=time.monotonic()-started
   _separator("训练完成")
   LOGGER.info(f"🎉 Sage 四维先验已生成: {Path(a.output).resolve()} | elapsed={elapsed:.2f}s")
-  header=(f"✅ <b>Sage 四维先验训练成功</b>\n📊 事件: <code>{len(events)}</code> | attempt: <code>{len(attempts)}</code>\n"+"\n".join(f"{name}: <code>{manifest['dimensions'][name]['confidence']:.6f}</code>" for name in DIMENSIONS))
-  send_telegram_logs(header,log_path);return manifest
+  return manifest
  except Exception:
   LOGGER.error(traceback.format_exc())
-  send_telegram_logs(f"❌ <b>Sage 四维先验训练失败</b>\n<code>{html.escape(traceback.format_exc()[-500:])}</code>",log_path)
   raise
  finally:_close_logging()
 if __name__=="__main__":run_training()

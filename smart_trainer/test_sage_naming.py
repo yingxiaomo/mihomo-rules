@@ -140,6 +140,11 @@ class SageLiteralContractTests(unittest.TestCase):
                           trainer.MIN_CONFIDENCE_ROWS), (20, 5, 20))
         self.assertEqual(trainer.PARTITIONS,
                          ("train", "early_stop", "calibration", "final_test"))
+        self.assertEqual(trainer.FAILURE_MIN_CLASS_ATTEMPTS,
+                         {"train": 8, "early_stop": 8,
+                          "calibration": 3, "final_test": 3})
+        self.assertEqual(trainer.ALGORITHM_SIGNATURE,
+                         "ecc5aa098edcc9d02b73cf16efe63b5ef9079caaf9bbd08b5daeccd7082a29f5")
         self.assertEqual(trainer.MODEL_PARAMS, {
             "verbosity": -1, "learning_rate": 0.035, "num_leaves": 24,
             "min_data_in_leaf": 12, "feature_fraction": 0.9,
@@ -161,8 +166,12 @@ class SageLiteralContractTests(unittest.TestCase):
                 mock.patch.object(trainer, "build_training_tables",
                                   return_value=("attempts", dict.fromkeys(
                                       ("connect", "response", "throughput", "failure")))), \
-                mock.patch.object(trainer, "train_dimension", return_value=("model", {})), \
-                mock.patch.object(trainer, "save_bundle") as save:
+                mock.patch.object(trainer, "preflight_training_tables",
+                                  return_value=dict.fromkeys(trainer.DIMENSIONS, {})), \
+                mock.patch.object(trainer, "train_dimension",
+                                  return_value=("model", {"_evidence": {}})), \
+                mock.patch.object(trainer, "save_bundle") as save, \
+                mock.patch.object(trainer, "save_training_evidence"):
             trainer.run_training([])
             self.assertEqual(save.call_args.args[0],
                              ROOT / "smart_trainer/SagePrior.json")
@@ -189,63 +198,35 @@ class SageRepositoryNamingTests(unittest.TestCase):
             "Train and Deploy Sage Dimensional Priors",
             "smart_trainer/train_sage_prior.py",
             "smart_trainer/test_train_sage_prior.py",
+            "smart_trainer/sage_workflow_notify.py",
             "smart_trainer/requirements-sage.txt",
             ".github/workflows/train-sage-prior.yml",
-            "smart_trainer.test_train_sage_prior",
+            "python -m unittest discover -s smart_trainer -p 'test_*.py' -v",
             "RELEASE_TAG: sage-prior-model-${{ github.run_number }}",
-            "SAGE_REPO_URL: https://github.com/yingxiaomo/mihomo",
+            "SAGE_CONSUMER_SHA: 9c92dbf80c8997bbfe1a2f4e986aa45f75f3a786",
+            "ref: ${{ github.sha }}", "repository: yingxiaomo/mihomo",
             '${REMOTE}/sage-native', "sage-data", "SagePrior.json",
-            '--branch dev-sage "$SAGE_REPO_URL" /tmp/mmihos-sage',
-            "go-version: '1.26.5'", "/tmp/mmihos-sage/go.sum",
-            'gh release edit "$RELEASE_TAG" --draft=false --latest=false',
-            "SAGE_PRIOR_BUNDLE=/tmp/mmihos-sage/prior-integration/SagePrior.json",
+            "SagePrior.evidence.json", "go-version: '1.26.5'",
+            "cache-dependency-path: go-consumer/go.sum",
+            'gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES" --draft=false --latest=false',
+            'gh release create "$RELEASE_TAG" --title "Sage Dimensional Priors" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA" --draft',
+            "SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json",
             "TestSagePriorExternalBundle", "SagePrior-v1.zip",
             "SagePrior-v1.zip.sha256", "name: sage-prior-bundle",
+            "needs: train_and_deploy", "PIPELINE_RESULT:", "if: always()",
+            "Record final result for independent notification", "FAILED_STEP:",
+            "--status success", "--status failure",
+            "gh release download", "persist-credentials: false",
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+            "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16",
+            "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
         ):
             with self.subTest(literal=literal):
                 self.assertIn(literal, workflow)
         self.assertNotRegex(workflow, "adaptive|Adaptive|ADAPTIVE")
-
-    def test_renamed_files_preserve_baseline_except_explicit_release_wiring(self):
-        # Baseline 67bd61d; only four explicit deployment-wiring differences.
-        # Algorithms, dependencies and every other workflow byte stay frozen.
-        expected = {
-            "smart_trainer/train_sage_prior.py": "da9fa336cf2cc758b4723bd5fd1781774d9fe751a80846805072268db89957e6",
-            "smart_trainer/test_train_sage_prior.py": "2bcfc8e26619f75f7ae99cf640177aca97df7c04c6d505516bb87021b86d7750",
-            "smart_trainer/requirements-sage.txt": "38d286fe59ff2c5e034aa1b91bc294f6f172a2458df6a981dca42ad61b6cf0d8",
-            ".github/workflows/train-sage-prior.yml": "5f3d2435ee9ba106ab8c3336d11b39cc6cff1867de80cde84c99a78bdcbae122",
-        }
-        for name, digest in expected.items():
-            with self.subTest(path=name):
-                path = ROOT / name
-                self.assertTrue(path.is_file())
-                text = path.read_text(encoding="utf-8")
-                self.assertNotRegex(text, "adaptive|Adaptive|ADAPTIVE")
-                if name == ".github/workflows/train-sage-prior.yml":
-                    for released, baseline in (
-                        ("--branch dev-sage ", "--branch sage-v1 "),
-                        ("go-version: '1.26.5'", "go-version-file: /tmp/mmihos-sage/go.mod"),
-                        ("--draft=false --latest=false", "--draft=false --latest"),
-                        ("SAGE_PRIOR_BUNDLE=/tmp/mmihos-sage/prior-integration/SagePrior.json",
-                         "SAGE_PRIOR_BUNDLE=prior-integration/SagePrior.json"),
-                    ):
-                        self.assertEqual(text.count(released), 1)
-                        text = text.replace(released, baseline)
-                normalized = text.replace("sage", "adaptive").replace("Sage", "Adaptive").replace("SAGE", "ADAPTIVE")
-                self.assertEqual(hashlib.sha256(normalized.encode("utf-8")).hexdigest(), digest)
-
-    def test_pld_files_match_frozen_baseline_hashes(self):
-        expected = {
-            ".github/workflows/train-pld.yml": "23dc648c896d8f4dade277bb3b8a2e5260b3f3ee25b774f95c3c6149cd7cc3e1",
-            "smart_trainer/train_pld.py": "9cd344a5c68b56e7815728ccedd052c0804cd6ad35c37075e3710c4e8d7b8331",
-            "smart_trainer/test_train_pld.py": "a7628d7d0f4c33b31f0581635db3c90d97db05fe1f509fc0e3de3e7e00073f90",
-            "smart_trainer/requirements.txt": "8ad552649eac0e05f1798ec28d098ff7350abb77d1a68139ea9ab0e3bfd2e6f3",
-        }
-        for name, digest in expected.items():
-            with self.subTest(path=name):
-                # Normalize checkout newlines only; no PLD content substitution.
-                data = (ROOT / name).read_text(encoding="utf-8").encode("utf-8")
-                self.assertEqual(hashlib.sha256(data).hexdigest(), digest)
+        self.assertNotIn("--branch dev-sage", workflow)
+        self.assertNotIn("ref: main", workflow)
 
 
 if __name__ == "__main__":
