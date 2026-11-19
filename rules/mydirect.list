@@ -3,30 +3,21 @@
 #---------------------------------------------------#
 #                   CDN & 云服务
 #---------------------------------------------------#
-+.azureedge.net
 +.msecnd.net
-+.blob.core.windows.net
 +.cloudapp.net
 +.cloudapp.azure.com
-+.akamaihd.net
 
 
 #---------------------------------------------------#
 #                       游戏
 #---------------------------------------------------#
-# Epic Games
-+.epicgames.com
+# 以下两个不在「游戏平台」规则集内，需单独指定直连
+# （epicgames / rockstargames / humblebundle / pvp.net / riotcdn
+#   已由 RULE-SET,游戏平台 覆盖；anticheatexpert 由 GEOSITE,cn 覆盖）
 # Razer
 +.razer.com
-# Rockstar Games
-+.rockstargames.com
-# Humble Bundle
-+.humblebundle.com
 # Final Fantasy XIV
 +.ffxiv.com
-# Riot Games
-+.pvp.net
-+.riotcdn.net
 
 
 #---------------------------------------------------#
