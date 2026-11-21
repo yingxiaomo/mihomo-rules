@@ -329,30 +329,41 @@ proxy-groups:
 
 # 规则匹配
 rules:
+  # 0. 管理与拦截 (优先级最高)
   # 屏蔽 QUIC (UDP 443)，强制浏览器使用 TCP，避免 UDP 代理失败导致重复匹配
   - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+
   # 组播/广播放行 (智能家居发现协议 SSDP/mDNS)
   - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
   - IP-CIDR,239.255.255.250/32,DIRECT,no-resolve
   - IP-CIDR,255.255.255.255/32,DIRECT,no-resolve
   - IP-CIDR6,ff00::/8,DIRECT,no-resolve
-  # 1. 基础通信放行 (P2P打洞端口)
-  - DST-PORT,3478,DIRECT
-  - DST-PORT,19302,DIRECT
+
+  # 1. 局域网与私有地址 (必须最前，防回环)
+  - RULE-SET,私有域名, 直连
+  - RULE-SET,私有ip, 直连,no-resolve
+
   # 2. 屏蔽广告
   - GEOSITE,category-ads-all, REJECT
 
-  # 3. 管理
-  - RULE-SET,私有域名, 直连
-  - RULE-SET,私有ip, 直连,no-resolve
+  # 3. 基础通信放行 (P2P打洞端口)
+  - DST-PORT,3478,DIRECT
+  - DST-PORT,19302,DIRECT
 
   # 4. 网络测试
   - RULE-SET,网络测试, 网络测试
 
-  # 5. 谷歌/消息推送
+  # 5. 下载 (BT trackers)
+  - RULE-SET,trackerslist, 直连
+
+  # 6. 游戏 (下载走直连，平台走代理)
+  - RULE-SET,游戏下载, 直连
+  - RULE-SET,游戏平台, 游戏平台
+
+  # 7. 谷歌 FCM 推送
   - RULE-SET,谷歌FCM, 香港自动
 
-  # 6. AI 服务
+  # 8. AI 服务
   - RULE-SET,ChatGPT, AI服务
   - RULE-SET,Claude, AI服务
   - RULE-SET,Meta AI, AI服务
@@ -361,43 +372,43 @@ rules:
   - RULE-SET,Copilot, AI服务
   - RULE-SET,AI服务, AI服务
 
-  # 7. 特定流媒体与大厂服务
-  - RULE-SET,电报域名, 电报消息
-  - RULE-SET,电报ip, 电报消息, no-resolve
+  # 9. 国内可直连的大厂服务 (必须早于各自的全局规则，否则永不生效)
+  - RULE-SET,谷歌cn, 直连
+  - RULE-SET,苹果cn, 直连
+  - RULE-SET,微软cn, 直连
+
+  # 10. 特定流媒体与大厂服务
   - RULE-SET,油管视频, 油管视频
+  - RULE-SET,电报域名, 电报消息
   - RULE-SET,Twitter, Twitter
+  - RULE-SET,谷歌域名, 谷歌服务
   - RULE-SET,TikTok, TikTok
   - RULE-SET,GitHub, GitHub
-  - RULE-SET,Bybit, Bybit服务
-  - RULE-SET,谷歌cn, 直连
-  - RULE-SET,谷歌域名, 谷歌服务
-  - RULE-SET,谷歌ip, 谷歌服务, no-resolve
-  - RULE-SET,苹果cn, 直连
   - RULE-SET,苹果服务, 苹果服务
-  - RULE-SET,微软cn, 直连
   - RULE-SET,微软云盘, 微软云盘
   - RULE-SET,微软服务, 微软服务
+  - RULE-SET,Bybit, Bybit服务
   - RULE-SET,Cloudflare, Cloudflare
 
-  # 8. 下载 (BT trackers)
-  - RULE-SET,trackerslist, 直连
-  # 9. 游戏相关
-  - RULE-SET,游戏下载, 直连
-  - RULE-SET,游戏平台, 游戏平台
+  # 11. 特定服务的 IP 兜底
+  - RULE-SET,电报ip, 电报消息, no-resolve
+  - RULE-SET,谷歌ip, 谷歌服务, no-resolve
 
-  # 10. 通用分流规则
-  - RULE-SET,代理顶级域名, 代理域名
-  - RULE-SET,代理域名, 代理域名
+  # 12. 国内域名 (必须早于代理兜底，避免被 TLD 规则抢走)
   - RULE-SET,直连域名, 直连
 
-  # 11. 默认规则
-  - RULE-SET,国内ip, 直连, no-resolve
-  # 12. 放行所有未被上方规则截获的未知 UDP 流量
+  # 13. 代理兜底
+  - RULE-SET,代理域名, 代理域名
+  - RULE-SET,代理顶级域名, 代理域名
+
+  # 14. 国内 IP 兜底
+  - RULE-SET,国内ip, 直连
+
+  # 15. UDP 兜底与最终规则
   - NETWORK,udp,DIRECT
   - MATCH, 漏网之鱼
 
 
-# 规则集类型锚点
 ip: &ip {type: http, interval: 86400, behavior: ipcidr, format: mrs}
 domain: &domain {type: http, interval: 86400, behavior: domain, format: mrs}
 domain_text: &domain_text {type: http, interval: 86400, behavior: domain, format: text}
@@ -406,37 +417,37 @@ class: &class {type: http, interval: 86400, behavior: classical, format: text}
 
 # 规则集
 rule-providers:
-  游戏下载: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/games-cn.mrs"}
-  游戏平台: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/games.mrs"}
-  私有域名: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/private.mrs"}
-  trackerslist: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/trackerslist.mrs"}
-  微软云盘: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/onedrive.mrs"}
-  微软cn: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/microsoft@cn.mrs"}
-  微软服务: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/microsoft.mrs"}
-  苹果cn: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/apple@cn.mrs"}
-  苹果服务: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/apple.mrs"}
-  谷歌cn: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/google-cn.mrs"}
-  谷歌FCM: { <<: *class, url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/GoogleFCM/GoogleFCM.list"}
-  网络测试: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/networktest.mrs"}
+  游戏下载: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/games-cn.mrs"}
+  游戏平台: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/games.mrs"}
+  私有域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/private.mrs"}
+  trackerslist: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/trackerslist.mrs"}
+  微软云盘: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/onedrive.mrs"}
+  微软cn: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/microsoft@cn.mrs"}
+  微软服务: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/microsoft.mrs"}
+  苹果cn: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/apple@cn.mrs"}
+  苹果服务: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/apple.mrs"}
+  谷歌cn: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/google-cn.mrs"}
+  谷歌FCM: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/googlefcm.mrs"}
+  网络测试: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/networktest.mrs"}
   ChatGPT: { <<: *domain, url: "https://gh-proxy.com/https://github.com/metacubex/meta-rules-dat/raw/refs/heads/meta/geo/geosite/openai.mrs"}
-  Claude: { <<: *class, url: "https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Claude/Claude.list"}
+  Claude: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/anthropic.mrs"}
   Meta AI: { <<: *class, url: "https://gh-proxy.com/https://raw.githubusercontent.com/liandu2024/clash/refs/heads/main/list/MetaAi.list"}
   Perplexity: { <<: *domain, url: "https://gh-proxy.com/https://github.com/metacubex/meta-rules-dat/raw/refs/heads/meta/geo/geosite/perplexity.mrs"}
   Copilot: { <<: *class, url: "https://gh-proxy.com/https://raw.githubusercontent.com/liandu2024/clash/refs/heads/main/list/Copilot.list"}
   Gemini: { <<: *class, url: "https://gh-proxy.com/https://raw.githubusercontent.com/liandu2024/clash/refs/heads/main/list/Gemini.list"}
-  AI服务: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/ai.mrs"}
-  GitHub: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/github.mrs"}
-  油管视频: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/youtube.mrs"}
-  谷歌域名: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/google.mrs"}
+  AI服务: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/ai.mrs"}
+  GitHub: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/github.mrs"}
+  油管视频: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/youtube.mrs"}
+  谷歌域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/google.mrs"}
   Twitter: { <<: *domain, url: "https://gh-proxy.com/https://github.com/metacubex/meta-rules-dat/raw/refs/heads/meta/geo/geosite/x.mrs"}
-  电报域名: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/telegram.mrs"}
-  Bybit: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/bybit.mrs"}
-  TikTok: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/tiktok.mrs"}
-  Cloudflare: { <<: *domain, url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/cloudflare.mrs"}
-  代理顶级域名: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/tld-proxy.mrs"}
-  代理域名: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/gfw.mrs"}
-  直连域名: { <<: *domain, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cn.mrs"}
-  私有ip: { <<: *ip, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/privateip.mrs"}
-  国内ip: { <<: *ip, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cnip.mrs"}
-  谷歌ip: { <<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/google.mrs"}
-  电报ip: { <<: *ip, url: "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/telegramip.mrs"}
+  电报域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/telegram.mrs"}
+  Bybit: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/bybit.mrs"}
+  TikTok: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/tiktok.mrs"}
+  Cloudflare: { <<: *domain, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/cloudflare.mrs"}
+  代理顶级域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/tld-proxy.mrs"}
+  代理域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/gfw.mrs"}
+  直连域名: { <<: *domain, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cn.mrs"}
+  私有ip: { <<: *ip, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/privateip.mrs"}
+  国内ip: { <<: *ip, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cnip.mrs"}
+  谷歌ip: { <<: *ip, url: "https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/google.mrs"}
+  电报ip: { <<: *ip, url: "https://gh-proxy.com/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/telegramip.mrs"}
